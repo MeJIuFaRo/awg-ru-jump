@@ -1,0 +1,15 @@
+[Unit]
+Description=Route Russian AmneziaWG client flows and preserve their return path
+Wants=docker.service ru-exit-tunnels.service awg-geo-dns.service
+Requires=awg-geo-base.service
+After=awg-geo-base.service docker.service ru-exit-tunnels.service awg-geo-dns.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/awg-geo/router start
+ExecStop=/usr/local/lib/awg-geo/router stop
+TimeoutStartSec=60s
+
+[Install]
+WantedBy=multi-user.target

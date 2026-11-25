@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.pcap
+*.pcapng
+*.log
+wgcf-account.toml
+wgcf-profile.conf
+exit-warp.conf
+*.key
+*.pem
+tunnels.env
+site.json
+site.local.json
+build/
+generated/
+wgcf/
+*.local

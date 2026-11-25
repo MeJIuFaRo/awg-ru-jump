@@ -1,0 +1,49 @@
+#!/bin/sh
+set -eu
+. /etc/ru-exit/tunnels.env
+case "$ROLE" in
+    ingress) local_end=1; remote_end=2 ;;
+    exit)    local_end=2; remote_end=1 ;;
+    *) echo 'ROLE must be ingress or exit' >&2; exit 1 ;;
+esac
+check_nexthop() {
+    id=$1
+    pattern=$2
+    current=$(ip nexthop get id "$id" 2>/dev/null || :)
+    if [ -n "$current" ] && ! printf '%s\n' "$current" | grep -Eq "^id $id $pattern[[:space:]]*$"; then
+        echo "Nexthop $id is already in use" >&2
+        exit 1
+    fi
+}
+check_nexthop 65101 "via 100[.]65[.]1[.]$remote_end dev rn-ipip( scope link)?"
+check_nexthop 65102 "via 100[.]65[.]2[.]$remote_end dev rn-gre( scope link)?"
+check_nexthop 65100 'group 65101/65102'
+ip link show dev "$WAN_IF" >/dev/null
+ip -o -4 addr show dev "$WAN_IF" | awk -v addr="$LOCAL_IPV4" '
+    {split($4,a,"/"); if (a[1]==addr) found=1} END {exit !found}' ||
+    { echo "LOCAL_IPV4 must be assigned to $WAN_IF" >&2; exit 1; }
+ip -4 route get "$PEER_IPV4" from "$LOCAL_IPV4" | awk -v iface="$WAN_IF" '
+    {for (i=1;i<NF;i++) if ($i=="dev" && $(i+1)==iface) found=1} END {exit !found}' ||
+    { echo "Peer route must use $WAN_IF" >&2; exit 1; }
+
+for item in ipip gre; do
+    name=rn-$item
+    if ip link show "$name" >/dev/null 2>&1; then
+        [ "$(cat "/sys/class/net/$name/ifalias")" = ru-exit-tunnels ] ||
+            { echo "Interface $name already exists with a different owner" >&2; exit 1; }
+    fi
+done
+
+for item in ipip gre; do
+    name=rn-$item
+    case "$item" in ipip) net=100.65.1 ;; gre) net=100.65.2 ;; esac
+    if ip link show "$name" >/dev/null 2>&1; then action=change; else action=add; fi
+    ip tunnel "$action" "$name" mode "$item" local "$LOCAL_IPV4" remote "$PEER_IPV4" dev "$WAN_IF" ttl 64
+    ip link set dev "$name" alias ru-exit-tunnels
+    ip link set dev "$name" mtu 1476 up
+    ip -4 addr replace "$net.$local_end/30" dev "$name"
+    sysctl -qw "net.ipv4.conf.$name.rp_filter=2"
+done
+ip nexthop get id 65101 >/dev/null 2>&1 || ip -4 nexthop add id 65101 via "100.65.1.$remote_end" dev rn-ipip
+ip nexthop get id 65102 >/dev/null 2>&1 || ip -4 nexthop add id 65102 via "100.65.2.$remote_end" dev rn-gre
+ip nexthop get id 65100 >/dev/null 2>&1 || ip nexthop add id 65100 group 65101/65102

@@ -1,0 +1,18 @@
+[Unit]
+Description=Match Amnezia client DNS responses against Russian domain rules
+Requires=awg-geo-base.service
+Wants=docker.service
+After=awg-geo-base.service docker.service
+
+[Service]
+ExecStart=/usr/local/lib/awg-geo/mosdns start -c /etc/awg-geo/mosdns.yaml -d /etc/awg-geo
+Restart=on-failure
+RestartSec=3s
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_NET_ADMIN
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+"""Build a private, IPv4-only wg-quick file from this node's wgcf profile."""
+import ipaddress
+import os
+import socket
+import sys
+import tempfile
+from pathlib import Path
+
+
+def main():
+    source, target = map(Path, sys.argv[1:])
+    sections = {"Interface": {}, "Peer": {}}
+    group = None
+    for raw in source.read_text(encoding="utf-8").splitlines():
+        line = raw.partition("#")[0].strip()
+        if line.startswith("[") and line.endswith("]"):
+            group = sections[line[1:-1]]
+        elif line:
+            key, value = (part.strip() for part in line.split("=", 1))
+            group.setdefault(key, []).append(value)
+    iface, peer = sections["Interface"], sections["Peer"]
+    addresses = (ipaddress.ip_interface(item.strip()) for row in iface["Address"] for item in row.split(","))
+    ipv4 = next(addr for addr in addresses if addr.version == 4)
+    host, port = peer["Endpoint"][0].rsplit(":", 1)
+    endpoint = socket.getaddrinfo(host, int(port), socket.AF_INET, socket.SOCK_DGRAM)[0][4][0]
+    lines = [
+        "[Interface]", f"PrivateKey = {iface['PrivateKey'][0]}", f"Address = {ipv4}",
+        "MTU = 1280", "Table = off", "", "[Peer]", f"PublicKey = {peer['PublicKey'][0]}",
+        f"Endpoint = {endpoint}:{port}", "AllowedIPs = 0.0.0.0/0", "PersistentKeepalive = 25",
+    ]
+    # Publish only a complete file, refusing to overwrite a previous identity.
+    with tempfile.NamedTemporaryFile(mode="w", dir=target.parent) as out:
+        out.write("\n".join(lines) + "\n")
+        out.flush()
+        os.link(out.name, target)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 3:
+        sys.exit("Usage: make-warp-profile WGCF_PROFILE DESTINATION")
+    try:
+        main()
+    except (KeyError, ValueError, StopIteration, OSError) as exc:
+        sys.exit(f"Could not build profile ({type(exc).__name__}); check input, endpoint and destination")

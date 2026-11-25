@@ -1,0 +1,10 @@
+[Unit]
+Description=Independently refresh Russian IP networks and DNS domain rules
+Wants=network-online.target
+After=network-online.target awg-geo-base.service docker.service
+Requires=awg-geo-base.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/lib/awg-geo/geo_update.py
+TimeoutStartSec=20min

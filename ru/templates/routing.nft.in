@@ -1,0 +1,52 @@
+table inet awg_geo {
+    set ru_nets {
+        type ipv4_addr
+        flags interval
+        auto-merge
+    }
+    set ru_dns_a { type ipv4_addr; }
+    set ru_dns_b { type ipv4_addr; }
+    set exit_ready { type ifname; }
+    set awg_macs { type ether_addr; }
+    set awg_ips { type ipv4_addr; }
+    set reserved {
+        type ipv4_addr
+        flags interval
+        elements = { @RESERVED_NETS@ }
+    }
+    counter geo_ru_net {}
+    counter geo_ru_dns {}
+    counter geo_exit {}
+    counter geo_ru_fallback {}
+
+    chain classify {
+        ct mark { 0x41570001, 0x41570002 } meta mark set ct mark return
+        ct mark != 0 return
+        ct state != { new, related } return
+        ip daddr @reserved return
+        fib daddr type != unicast return
+        ip daddr @ru_nets counter name geo_ru_net ct mark set 0x41570001 meta mark set ct mark return
+        ip daddr @ru_dns_a counter name geo_ru_dns ct mark set 0x41570001 meta mark set ct mark return
+        ip daddr @ru_dns_b counter name geo_ru_dns ct mark set 0x41570001 meta mark set ct mark return
+        iifname @exit_ready counter name geo_exit ct mark set 0x41570002 meta mark set ct mark return
+        counter name geo_ru_fallback ct mark set 0x41570001 meta mark set ct mark
+    }
+    chain ingress {
+        type filter hook prerouting priority mangle; policy accept;
+        iifname "@BRIDGE_IF@" ether saddr @awg_macs ip saddr @CLIENT_NET@ ct direction original jump classify
+    }
+    chain direct_nat {
+        type nat hook postrouting priority srcnat - 1; policy accept;
+        oifname "@WAN_IF@" ip saddr @CLIENT_NET@ ct direction original ct mark 0x41570001 masquerade
+    }
+    chain resolver_acl {
+        type filter hook input priority filter - 5; policy accept;
+        ip daddr @BRIDGE_GW@ meta l4proto { tcp, udp } th dport 1053 jump resolver_source
+    }
+    chain resolver_source {
+        iifname "lo" return
+        iifname "@BRIDGE_IF@" ether saddr @awg_macs ip saddr @awg_ips return
+        iifname "@BRIDGE_IF@" ether saddr @awg_macs ip saddr @CLIENT_NET@ return
+        drop
+    }
+}

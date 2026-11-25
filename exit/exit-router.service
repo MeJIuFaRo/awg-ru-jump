@@ -1,0 +1,13 @@
+[Unit]
+Description=IPv4 transit and symmetric return paths
+Requires=ru-exit-tunnels.service
+After=ru-exit-tunnels.service wg-quick@exit-warp.service docker.service nftables.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/exit-router
+ExecReload=/usr/local/sbin/exit-router
+
+[Install]
+WantedBy=multi-user.target

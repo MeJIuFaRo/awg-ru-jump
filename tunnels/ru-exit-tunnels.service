@@ -1,0 +1,13 @@
+[Unit]
+Description=IPIP and GRE between the two IPv4 routers
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/ru-exit-tunnels
+ExecReload=/usr/local/sbin/ru-exit-tunnels
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,8 @@
+[Unit]
+Description=Probe WARP and choose the egress for new connections
+Requires=exit-router.service
+After=exit-router.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/exit-health

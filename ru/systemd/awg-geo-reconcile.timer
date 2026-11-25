@@ -1,0 +1,10 @@
+[Unit]
+Description=Reconcile the active AmneziaWG namespace
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=15s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

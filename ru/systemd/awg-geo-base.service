@@ -1,0 +1,13 @@
+[Unit]
+Description=Load Russian geo network sets and AWG routing classifiers
+After=local-fs.target nftables.service
+Before=awg-geo-router.service awg-geo-dns.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/awg-geo/apply-data base-start
+ExecStop=/usr/local/lib/awg-geo/apply-data snapshot
+
+[Install]
+WantedBy=multi-user.target

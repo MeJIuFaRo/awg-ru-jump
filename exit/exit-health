@@ -1,0 +1,33 @@
+#!/bin/sh
+set -eu
+# A bound IPv4 socket uses rule 18573 and cannot silently probe the WAN.
+probe() {
+    for addr in 1.1.1.1 1.0.0.1; do
+        if curl --noproxy '*' -4fsS --interface if!exit-warp --connect-timeout 2 --max-time 3 \
+            "https://$addr/cdn-cgi/trace" 2>/dev/null | grep -Eq '^warp=(on|plus)$'; then
+            return 0
+        fi
+    done
+    return 1
+}
+was_up=0
+if nft 'get element ip exit_transit warp_ingress { "rn-gre" }' >/dev/null 2>&1; then was_up=1; fi
+if ip link show dev exit-warp >/dev/null 2>&1; then
+    ip -4 route replace table 51873 default dev exit-warp metric 10
+    if probe; then
+        if [ "$was_up" = 0 ]; then
+            nft 'add element ip exit_transit warp_ingress { "rn-gre", "rn-ipip" }'
+            echo 'New connections use WARP'
+        fi
+        exit 0
+    fi
+fi
+if [ "$was_up" = 1 ]; then
+    nft flush set ip exit_transit warp_ingress
+    for proto in udp icmp; do
+        for mark in 0x50000 0x60000; do
+            conntrack -D -f ipv4 -p "$proto" --mark "$mark/0xf0000" >/dev/null 2>&1 || :
+        done
+    done
+    echo 'New connections use the exit WAN'
+fi

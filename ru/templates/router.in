@@ -1,0 +1,475 @@
+#!/usr/bin/env python3
+"""Apply AWG-only routing on the RU host. The dataset service owns the nft table."""
+import concurrent.futures
+import contextlib
+import fcntl
+import http.client
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import socket
+import ssl
+import subprocess
+import sys
+import time
+
+RUN = Path("/run/awg-geo")
+NET = "@CLIENT_NET@"
+BR = "@BRIDGE_IF@"
+GW = "@BRIDGE_GW@"
+CONTAINER = "amnezia-awg2"
+NAT_CHAIN = "AWGGEO_PUBLIC"
+TAG = "awg-geo"
+RU, EXIT = "0x41570001", "0x41570002"
+TABLE = "61570"
+CLIENT_TABLE = "61573"
+CLIENT_PRIORITY = "9163"
+PROTO = "242"
+GROUP = 65100
+PROBE = "1.1.1.1"
+CF_DESTS = ["1.1.1.1", "1.0.0.1"]
+CF_EXIT = "0x41570202"
+CF_FILE = Path(__file__).resolve().with_name("cloudflare.nft")
+# name: (source, SO_MARK, route table, nexthop)
+PATHS = {"rn-ipip": ("100.65.1.1", "0x41570101", "61571", 65101),
+         "rn-gre": ("100.65.2.1", "0x41570102", "61572", 65102)}
+RULES = [(9160, EXIT, TABLE), (9161, PATHS["rn-ipip"][1], "61571"),
+         (9162, PATHS["rn-gre"][1], "61572")]
+IP = ["ip", "-4", "-N"]
+
+
+def call(args, *, check=True, data=None):
+    p = subprocess.run(args, text=True, input=data, capture_output=True)
+    if check and p.returncode:
+        raise RuntimeError(f"{' '.join(args)}: {p.stderr.strip() or p.stdout.strip()}")
+    return p
+
+
+def load(name):
+    path = RUN / name
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+def save(name, state):
+    tmp = RUN / (name + ".tmp")
+    tmp.write_text(json.dumps(state, sort_keys=True) + "\n")
+    tmp.replace(RUN / name)
+
+
+def members(name):
+    obj = json.loads(call(["nft", "-j", "list", "set", "inet", "awg_geo", name]).stdout)
+    return next(entry["set"] for entry in obj["nftables"] if "set" in entry).get("elem", [])
+
+
+def set_members(values):
+    lines = []
+    for name, desired in values.items():
+        if sorted(members(name)) != sorted(desired):
+            lines.append(f"flush set inet awg_geo {name}")
+            if desired:
+                items = ", ".join(f'"{v}"' if name == "exit_ready" else v for v in desired)
+                lines.append(f"add element inet awg_geo {name} {{ {items} }}")
+    if lines:
+        call(["nft", "-f", "-"], data="\n".join(lines) + "\n")
+
+
+def public_exceptions():
+    nets = []
+    for item in members("reserved"):
+        if isinstance(item, dict):
+            if "range" in item:
+                first, last = map(ipaddress.IPv4Address, item["range"])
+                nets.extend(map(str, ipaddress.summarize_address_range(first, last)))
+                continue
+            prefix = item["prefix"]
+            item = f"{prefix['addr']}/{prefix['len']}"
+        nets.append(str(ipaddress.IPv4Network(item)))
+    return nets
+
+
+def rule(pref, mark, table, enable):
+    args = ["pref", str(pref), "fwmark", mark, "lookup", table]
+    rows = json.loads(call(IP + ["-j", "rule", "show", "pref", str(pref)]).stdout)
+    expected = {"priority": pref, "src": "all", "fwmark": mark, "table": table}
+    if rows and rows != [expected]:
+        raise RuntimeError(f"foreign ip rule at priority {pref}: {rows}")
+    if bool(rows) != enable:
+        call(IP + ["rule", "add" if enable else "del"] + args)
+
+
+def routes(table, dst=None, ns=()):
+    args = ["exact", dst] if dst else []
+    res = call([*ns, *IP, "-j", "route", "show", "table", table, *args], check=False)
+    if res.returncode and "FIB table does not exist" in res.stderr:
+        return []
+    if res.returncode:
+        raise RuntimeError(res.stderr)
+    return json.loads(res.stdout)
+
+
+def nextroute(table, dst, nhid=None, remove=False):
+    rows = [r for r in routes(table, dst) if not is_guard(r, table)]
+    if any(str(row.get("protocol")) != PROTO for row in rows) or len(rows) > 1:
+        raise RuntimeError(f"foreign route {dst} in table {table}: {rows}")
+    if remove and not rows:
+        return
+    if rows and not remove and rows[0].get("nhid") == nhid:
+        return
+    args = ["route", "del" if remove else ("replace" if rows else "add"),
+            dst, "table", table, "proto", PROTO]
+    if not remove:
+        args += ["nhid", str(nhid)]
+    call(IP + args)
+
+
+def is_guard(row, table):
+    return (table == TABLE and str(row.get("type")) in ("7", "unreachable") and
+            row.get("metric") == 32760 and str(row.get("protocol")) == PROTO)
+
+
+def guard(enable):
+    rows = routes(TABLE, "default")
+    exists = any(is_guard(row, TABLE) for row in rows)
+    if enable != exists:
+        call(IP + ["route", "add" if enable else "del", "unreachable", "default",
+                   "table", TABLE, "proto", PROTO, "metric", "32760"])
+
+
+def client_route(address=None):
+    rows = routes("main", NET)
+    if rows and (len(rows) != 1 or str(rows[0].get("protocol")) != PROTO):
+        if address and not all(r.get("dev") == BR and r.get("gateway") == address for r in rows):
+            raise RuntimeError(f"conflicting route to AWG clients: {rows}")
+        return
+    if not address:
+        if rows:
+            call(IP + ["route", "del", NET, "dev", BR, "proto", PROTO, "via", rows[0]["gateway"]])
+        return
+    if not rows or rows[0].get("gateway") != address or rows[0].get("dev") != BR:
+        call(IP + ["route", "replace" if rows else "add", NET, "via", address, "dev", BR, "proto", PROTO])
+
+
+def rpfilter(enable):
+    saved = load("rpfilter.json")
+    base = Path("/proc/sys/net/ipv4/conf")
+    for dev in PATHS:
+        knob = base / dev / "rp_filter"
+        if not knob.exists():
+            continue
+        current = int(knob.read_text())
+        idx = socket.if_nametoindex(dev)
+        if enable and max(current, int((base / "all/rp_filter").read_text())) == 1:
+            saved[dev] = [idx, current]
+            save("rpfilter.json", saved)
+            knob.write_text("2\n")
+        if not enable and dev in saved and saved[dev][0] == idx and current == 2:
+            knob.write_text(str(saved[dev][1]) + "\n")
+    if not enable:
+        (RUN / "rpfilter.json").unlink(missing_ok=True)
+
+
+@contextlib.contextmanager
+def container_netns(optional=False):
+    p = call(["docker", "inspect", "--type", "container", CONTAINER], check=False)
+    if p.returncode:
+        if optional and "No such" in p.stderr:
+            yield None
+            return
+        raise RuntimeError(p.stderr.strip())
+    info = json.loads(p.stdout)[0]
+    pid = info["State"]["Pid"]
+    if not pid and optional:
+        yield None
+        return
+    with open(f"/proc/{pid}/ns/net", "rb", buffering=0) as fd:
+        if os.fstat(fd.fileno()).st_ino == os.stat("/proc/self/ns/net").st_ino:
+            raise RuntimeError("AWG unexpectedly shares the host network namespace")
+        ns = ["nsenter", f"--net=/proc/{os.getpid()}/fd/{fd.fileno()}", "--"]
+        if optional:
+            yield ns, None, None, None
+            return
+        networks = info["NetworkSettings"]["Networks"]
+        endpoints = [n for n in networks.values() if n["Gateway"] == GW]
+        if len(endpoints) != 1 or networks.get("@DOCKER_NET@") != endpoints[0]:
+            raise RuntimeError(f"expected one AWG Docker endpoint on the bridge with gateway {GW}")
+        nic = endpoints[0]
+        address = str(ipaddress.IPv4Address(nic["IPAddress"]))
+        mac = nic["MacAddress"].lower()
+        if not re.fullmatch(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", mac):
+            raise RuntimeError("invalid AWG bridge MAC")
+        links = json.loads(call(ns + ["ip", "-j", "address", "show"]).stdout)
+        devs = [link["ifname"] for link in links if link.get("address", "").lower() == mac
+                and any(a.get("local") == address for a in link.get("addr_info", []))]
+        if len(devs) != 1:
+            raise RuntimeError(f"cannot map AWG Docker endpoint {address}/{mac} to one interface")
+        yield ns, address, mac, devs[0]
+
+
+def ipt_rule(ipt, table, chain, args, enable, *, insert=True):
+    prefix = ipt + ["-w", "5", "-t", table]
+    exists = call(prefix + ["-C", chain] + args, check=False)
+    if exists.returncode not in (0, 1):
+        raise RuntimeError(exists.stderr)
+    if enable and exists.returncode:
+        call(prefix + (["-I", chain, "1"] if insert else ["-A", chain]) + args)
+    if not enable and not exists.returncode:
+        call(prefix + ["-D", chain] + args)
+
+
+def host_forward(enable):
+    comment = ["-m", "comment", "--comment", TAG, "-j", "ACCEPT"]
+    for dev in ["@WAN_IF@", *PATHS]:
+        mark = RU if dev == "@WAN_IF@" else EXIT
+        outbound = ["-i", BR, "-s", NET, "-o", dev, "-m", "connmark", "--mark", mark]
+        inbound = ["-i", dev, "-o", BR, "-d", NET, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED"]
+        ipt_rule(["iptables"], "filter", "DOCKER-USER", outbound + comment, enable)
+        ipt_rule(["iptables"], "filter", "DOCKER-USER", inbound + comment, enable)
+
+
+def cloudflare_installed():
+    return call(["nft", "list", "set", "inet", "awg_geo", "cf_exit_dsts"], check=False).returncode == 0
+
+
+def cloudflare_policy(enable):
+    installed = cloudflare_installed()
+    if installed and not enable:
+        chains = ["cf_host", "cf_dns", "cf_snat", "cf_choose"]
+        lines = [f"flush chain inet awg_geo {chain}" for chain in chains]
+        lines += [f"delete chain inet awg_geo {chain}" for chain in chains]
+        lines.append("delete set inet awg_geo cf_exit_dsts")
+        call(["nft", "-f", "-"], data="\n".join(lines) + "\n")
+    rule(9164, CF_EXIT, TABLE, enable)
+    for dev in PATHS:
+        mark = ["-m", "connmark", "--mark", CF_EXIT]
+        comment = ["-m", "comment", "--comment", "awg-geo-cf", "-j", "ACCEPT"]
+        outbound = ["-i", BR, "-s", "@DNS_IP@", "-o", dev]
+        inbound = ["-i", dev, "-o", BR, "-d", "@DNS_IP@", "-m", "conntrack",
+                   "--ctstate", "ESTABLISHED,RELATED"]
+        for direction in [outbound, inbound]:
+            ipt_rule(["iptables"], "filter", "DOCKER-USER", direction + mark + comment, enable)
+    if enable:
+        active = BR in members("exit_ready")
+        if installed:
+            set_members({"cf_exit_dsts": CF_DESTS if active else []})
+        else:
+            ruleset = CF_FILE.read_text() + "\n"
+            if active:
+                ruleset += "add element inet awg_geo cf_exit_dsts { " + ", ".join(CF_DESTS) + " }\n"
+            call(["nft", "-f", "-"], data=ruleset)
+
+
+def advertise_exit(ready):
+    values = {"exit_ready": [BR] if ready else []}
+    if cloudflare_installed():
+        values["cf_exit_dsts"] = CF_DESTS if ready else []
+    set_members(values)
+
+
+def container_policy(ns, dev=None):
+    rule_args = ["pref", CLIENT_PRIORITY, "iif", "@AWG_IF@", "from", NET, "lookup", CLIENT_TABLE]
+    rules = json.loads(call(ns + IP + ["-j", "rule", "show", "pref", CLIENT_PRIORITY]).stdout)
+    for row in rules:
+        if "srclen" in row:
+            row["src"] = f"{row['src']}/{row.pop('srclen')}"
+        row.pop("iif_detached", None)
+    expected = {"priority": int(CLIENT_PRIORITY), "iif": "@AWG_IF@", "src": NET, "table": CLIENT_TABLE}
+    if rules and rules != [expected]:
+        raise RuntimeError(f"foreign AWG namespace policy at {CLIENT_PRIORITY}: {rules}")
+    rows = routes(CLIENT_TABLE, ns=ns)
+    if dev and any(str(r.get("protocol")) != PROTO for r in rows):
+        raise RuntimeError(f"foreign AWG namespace routes in table {CLIENT_TABLE}: {rows}")
+    own = [r for r in rows if str(r.get("protocol")) == PROTO]
+    args = ["table", CLIENT_TABLE, "proto", PROTO]
+    if not dev:
+        if rules:
+            call(ns + IP + ["rule", "del", *rule_args])
+        for r in own:
+            if str(r.get("type")) == "9":
+                call(ns + IP + ["route", "del", "throw", r["dst"], *args])
+            elif r.get("dst") == "default" and r.get("gateway") == GW:
+                call(ns + IP + ["route", "del", "default", "via", GW, "dev", r["dev"], *args])
+        return
+    # A throw resumes normal namespace routing for infrastructure, including Docker DNS.
+    reserved = set(public_exceptions())
+    throws = {str(ipaddress.IPv4Network(r["dst"])) for r in own if str(r.get("type")) == "9"}
+    for prefix in sorted(reserved - throws):
+        call(ns + IP + ["route", "add", "throw", prefix, *args])
+    default = next((r for r in own if r["dst"] == "default"), {})
+    if default.get("gateway") != GW or default.get("dev") != dev:
+        call(ns + IP + ["route", "replace" if default else "add", "default", "via", GW, "dev", dev, *args])
+    for prefix in sorted(throws - reserved):
+        call(ns + IP + ["route", "del", "throw", prefix, *args])
+    if not rules:
+        call(ns + IP + ["rule", "add", *rule_args])
+
+
+def container_rules(ns, enable, dev=None):
+    for binary in ["iptables", "iptables-legacy"]:
+        p = call(ns + [binary, "-t", "nat", "-S", "POSTROUTING"], check=False)
+        lines = [shlex.split(line) for line in p.stdout.splitlines()]
+        owned = [line[2:] for line in lines if line[:2] == ["-A", "POSTROUTING"]
+                 and line[-2:] == ["-j", NAT_CHAIN] and "--comment" in line
+                 and line[line.index("--comment") + 1] == TAG]
+        if owned or any(NET in line and "-j" in line and line[line.index("-j") + 1] == "MASQUERADE"
+                        for line in lines):
+            break
+    else:
+        if not enable:
+            # A newly created container may still be initializing and have no hooks.
+            if not any(call(ns + [b, "-t", "nat", "-S", NAT_CHAIN], check=False).returncode == 0
+                       for b in ["iptables", "iptables-legacy"]):
+                return
+        raise RuntimeError("AWG namespace client MASQUERADE missing")
+    ipt = ns + [binary]
+    nat = ipt + ["-w", "5", "-t", "nat"]
+    tagged = ["-m", "comment", "--comment", TAG]
+    jump = ["-s", NET, "-o", dev, *tagged, "-j", NAT_CHAIN] if enable else None
+    exists = call(nat + ["-S", NAT_CHAIN], check=False).returncode == 0
+    if enable and not exists:
+        call(nat + ["-N", NAT_CHAIN])
+    if enable or exists:
+        # Only the public branch terminates NAT before Amnezia's MASQUERADE.
+        # Insert exclusions above ACCEPT, including when recovering a partial run.
+        local = ["-m", "addrtype", "!", "--dst-type", "UNICAST", *tagged, "-j", "RETURN"]
+        rules = [local] + [["-d", n, *tagged, "-j", "RETURN"] for n in public_exceptions()]
+        for r in rules:
+            ipt_rule(ipt, "nat", NAT_CHAIN, r, enable)
+        ipt_rule(ipt, "nat", NAT_CHAIN, [*tagged, "-j", "ACCEPT"], enable, insert=False)
+        if enable:
+            ipt_rule(ipt, "nat", "POSTROUTING", jump, True)
+        for old in owned:
+            if not enable or old != jump:
+                ipt_rule(ipt, "nat", "POSTROUTING", old, False)
+        if not enable:
+            call(nat + ["-X", NAT_CHAIN])
+    for proto in ["tcp", "udp"]:
+        dnat = ["-i", "@AWG_IF@", "-s", NET, "-d", "@DNS_IP@", "-p", proto, "--dport", "53",
+                *tagged, "-j", "DNAT", "--to-destination", GW + ":1053"]
+        ipt_rule(ipt, "nat", "PREROUTING", dnat, enable)
+
+
+def reconcile():
+    with container_netns() as (ns, address, mac, bridge_port):
+        # Activate unmasqueraded traffic after the host can process both directions.
+        client_route(address)
+        rpfilter(True)
+        guard(True)
+        for _, _, table, nhid in PATHS.values():
+            if call(IP + ["nexthop", "show", "id", str(nhid)], check=False).returncode == 0:
+                nextroute(table, PROBE + "/32", nhid)
+        for args in RULES:
+            rule(*args, True)
+        host_forward(True)
+        set_members({"awg_macs": [mac], "awg_ips": [address]})
+        container_rules(ns, True, bridge_port)
+        container_policy(ns, bridge_port)
+        cloudflare_policy(CF_FILE.is_file())
+        (RUN / "enabled").touch()
+
+
+def stop():
+    (RUN / "enabled").unlink(missing_ok=True)
+    set_members({"exit_ready": []})
+    cloudflare_policy(False)
+    with container_netns(optional=True) as info:
+        if info:
+            container_policy(info[0])
+            container_rules(info[0], False)
+    set_members({"awg_macs": [], "awg_ips": []})
+    host_forward(False)
+    for args in RULES:
+        rule(*args, False)
+    for _, _, table, _ in PATHS.values():
+        nextroute(table, PROBE + "/32", remove=True)
+    nextroute(TABLE, "default", remove=True)
+    guard(False)
+    client_route()
+    rpfilter(False)
+    (RUN / "health.json").unlink(missing_ok=True)
+
+
+def probe(dev):
+    source, mark, _, _ = PATHS[dev]
+    try:
+        lookup = call(IP + ["-j", "route", "get", PROBE, "from", source, "mark", mark])
+        if json.loads(lookup.stdout)[0].get("dev") != dev:
+            return False, "probe route missing"
+        deadline = time.monotonic() + 5
+        context = ssl.create_default_context()
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_MARK, int(mark, 16))
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, dev.encode() + b"\0")
+            sock.bind((source, 0))
+            sock.settimeout(max(0.05, deadline - time.monotonic()))
+            sock.connect((PROBE, 443))
+            sock.settimeout(max(0.05, deadline - time.monotonic()))
+            with context.wrap_socket(sock, server_hostname=PROBE) as tls:
+                tls.settimeout(max(0.05, deadline - time.monotonic()))
+                tls.sendall(b"GET /cdn-cgi/trace HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n")
+                with http.client.HTTPResponse(tls) as response:
+                    response.begin()
+                    if response.status != 200:
+                        return False, f"HTTP {response.status}"
+                    body = response.read(16384).decode("ascii")
+        trace = dict(line.split("=", 1) for line in body.splitlines() if "=" in line)
+        addr = ipaddress.IPv4Address(trace["ip"])
+        warp = trace.get("warp", "")
+        return (warp in ("on", "plus") or str(addr) == "@EXIT_PUBLIC@"), f"ip={addr} warp={warp}"
+    except (OSError, RuntimeError, ValueError, KeyError, http.client.HTTPException) as exc:
+        return False, str(exc)
+
+
+def transition(previous, passed, detail):
+    streak = min(2, previous.get("streak", 0) + 1) if previous.get("passed") == passed else 1
+    up = passed if streak >= 2 else previous.get("up", False)
+    return {"up": up, "passed": passed, "streak": streak, "detail": detail}
+
+
+def health():
+    if not (RUN / "enabled").exists():
+        return
+    old = load("health.json")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(probe, PATHS))
+    paths = {dev: transition(old.get("paths", {}).get(dev, {}), *result)
+             for dev, result in zip(PATHS, results)}
+    ready = [dev for dev in PATHS if paths[dev]["up"]]
+    nhid = GROUP if len(ready) == 2 else (PATHS[ready[0]][3] if ready else None)
+    if nhid is not None:
+        try:
+            nextroute(TABLE, "default", nhid)
+            advertise_exit(True)
+        except RuntimeError:
+            advertise_exit(False)
+            raise
+    else:
+        # New flows use RU. Old EXIT sessions retain their marked table and nexthop.
+        advertise_exit(False)
+    if any(paths[d]["up"] != old.get("paths", {}).get(d, {}).get("up") for d in paths):
+        print(json.dumps({"paths": paths, "new_flow_nhid": nhid}), flush=True)
+    save("health.json", {"paths": paths, "new_flow_nhid": nhid, "timestamp": int(time.time())})
+
+
+def main():
+    os.environ["LC_ALL"] = "C"
+    if len(sys.argv) != 2 or sys.argv[1] not in {"start", "reconcile", "stop", "health"}:
+        sys.exit("usage: router start|reconcile|stop|health")
+    RUN.mkdir(mode=0o750, parents=True, exist_ok=True)
+    with (RUN / "router.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if sys.argv[1] == "health":
+            health()
+        elif sys.argv[1] == "stop":
+            stop()
+        else:
+            reconcile()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (RuntimeError, OSError, ValueError, KeyError, StopIteration) as error:
+        sys.exit(f"awg-geo: {error!s}")

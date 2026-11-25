@@ -1,0 +1,10 @@
+[Unit]
+Description=Check RunetFreedom GeoIP and GeoSite once a day
+
+[Timer]
+OnCalendar=*-*-* 01:15:00 UTC
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

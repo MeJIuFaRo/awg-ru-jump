@@ -1,0 +1,9 @@
+[Unit]
+Description=Check GRE and IPIP Internet paths for AmneziaWG clients
+After=awg-geo-router.service
+
+[Service]
+Type=oneshot
+ExecCondition=/usr/bin/systemctl is-active --quiet awg-geo-router.service
+ExecStart=/usr/local/lib/awg-geo/health
+TimeoutStartSec=22s

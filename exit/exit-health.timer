@@ -1,0 +1,11 @@
+[Unit]
+Description=Check IPv4 egress over WARP
+
+[Timer]
+OnBootSec=3s
+OnUnitInactiveSec=8s
+AccuracySec=1s
+Unit=exit-health.service
+
+[Install]
+WantedBy=timers.target

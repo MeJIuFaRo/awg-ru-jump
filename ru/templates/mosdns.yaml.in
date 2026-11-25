@@ -1,0 +1,61 @@
+log:
+  level: warn
+plugins:
+  - tag: russian_names
+    type: domain_set
+    args:
+      files:
+        - /var/lib/awg-geo/geosite/current/rules.txt
+  - tag: amnezia
+    type: forward
+    args:
+      upstreams:
+        - addr: tcp://@DNS_IP@:53
+          enable_pipeline: false
+  - tag: yandex
+    type: forward
+    args:
+      concurrent: 2
+      upstreams:
+        - addr: tls://common.dot.dns.yandex.net
+          dial_addr: 77.88.8.8:853
+        - addr: tls://common.dot.dns.yandex.net
+          dial_addr: 77.88.8.1:853
+  - tag: resolve_russian
+    type: sequence
+    args:
+      - exec: cache 4096
+      - matches:
+          - has_resp
+        exec: return
+      - exec: $yandex
+  - tag: remember_ipv4
+    type: sequence
+    args:
+      - exec: nftset inet,awg_geo,ru_dns_a,ipv4_addr,32
+      - exec: nftset inet,awg_geo,ru_dns_b,ipv4_addr,32
+  - tag: resolve
+    type: sequence
+    args:
+      - matches:
+          - qtype 28
+        exec: reject 0
+      - matches:
+          - qname $russian_names
+        exec: $resolve_russian
+      - matches:
+          - "!qname $russian_names"
+        exec: $amnezia
+      - exec: strip_ipv6hint
+      - matches:
+          - qname $russian_names
+        exec: $remember_ipv4
+      - exec: ttl 0-3600
+  - type: udp_server
+    args:
+      entry: resolve
+      listen: @BRIDGE_GW@:1053
+  - type: tcp_server
+    args:
+      entry: resolve
+      listen: @BRIDGE_GW@:1053

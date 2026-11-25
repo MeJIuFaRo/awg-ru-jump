@@ -1,0 +1,78 @@
+#!/bin/sh
+set -eu
+. /etc/ru-exit/tunnels.env
+[ "$ROLE" = exit ]
+case "$WAN_IF" in ''|*[!a-zA-Z0-9_.-]*) exit 1 ;; esac
+python3 -c 'import ipaddress, sys; ipaddress.IPv4Network(sys.argv[1])' "$CLIENT_CIDR"
+docker_rules() {
+    command -v iptables >/dev/null && iptables -w 5 -S DOCKER-USER >/dev/null 2>&1 || return 0
+    for tunnel in rn-ipip rn-gre; do
+        case "$tunnel" in rn-ipip) mark=0x20000 ;; rn-gre) mark=0x10000 ;; esac
+        for uplink in "$WAN_IF" exit-warp; do
+            docker_rule -i "$tunnel" -o "$uplink" -m conntrack --ctdir ORIGINAL --ctstate NEW,ESTABLISHED,RELATED -m connmark --mark "$mark/0x30000"
+            docker_rule -i "$uplink" -o "$tunnel" -m conntrack --ctdir REPLY --ctstate ESTABLISHED,RELATED -m connmark --mark "$mark/0x30000"
+        done
+    done
+}
+action=${1:-apply}
+docker_rule() {
+    set -- "$@" -m comment --comment exit-transit -j ACCEPT
+    if iptables -w 5 -C DOCKER-USER "$@" 2>/dev/null; then
+        if [ "$action" = down ]; then iptables -w 5 -D DOCKER-USER "$@"; fi
+    elif [ "$action" = apply ]; then
+        iptables -w 5 -I DOCKER-USER 1 "$@"
+    fi
+}
+if [ "$action" = down ]; then
+    docker_rules
+    if nft list table ip exit_transit >/dev/null 2>&1; then nft delete table ip exit_transit; fi
+    ip -4 rule del pref 18570 fwmark 0x10000/0xf0000 lookup 51874 2>/dev/null || :
+    ip -4 rule del pref 18571 fwmark 0x20000/0xf0000 lookup 51875 2>/dev/null || :
+    ip -4 rule del pref 18572 fwmark 0x40000/0xf0000 lookup 51873 2>/dev/null || :
+    ip -4 rule del pref 18573 oif exit-warp lookup 51873 2>/dev/null || :
+    ip -4 rule del pref 18574 fwmark 0x80000/0xf0000 lookup main 2>/dev/null || :
+    ip -4 route del table 51873 default dev exit-warp metric 10 2>/dev/null || :
+    ip -4 route del table 51874 default via 100.65.2.1 dev rn-gre metric 10 2>/dev/null || :
+    ip -4 route del table 51875 default via 100.65.1.1 dev rn-ipip metric 10 2>/dev/null || :
+    for table in 51873 51874 51875; do
+        ip -4 route del table "$table" unreachable default metric 32760 2>/dev/null || :
+    done
+    exit 0
+fi
+[ "$action" = apply ]
+[ "$(cat /proc/sys/net/ipv4/ip_forward)" = 1 ]
+
+apply_policy() {
+    nft "$@" -D "wan=\"$WAN_IF\"" -D "clients=$CLIENT_CIDR" -f /etc/ru-exit/exit-policy.nft
+}
+apply_policy -c
+
+ensure_rule() {
+    pref=$1
+    shift
+    existing=$(ip -4 rule show pref "$pref")
+    if [ -z "$existing" ]; then
+        ip -4 rule add pref "$pref" "$@"
+    elif ! printf '%s\n' "$existing" | awk -v expected="from all $*" '
+        {sub(/^[[:space:]]*[0-9]+:[[:space:]]*/, ""); sub(/[[:space:]]+\[detached\]/,""); sub(/[[:space:]]+$/, "")}
+        $0 != expected {bad=1} END {exit bad || NR!=1}'; then
+        echo "Another routing rule uses priority $pref" >&2
+        exit 1
+    fi
+}
+ip -4 route replace table 51874 default via 100.65.2.1 dev rn-gre onlink metric 10
+ip -4 route replace table 51875 default via 100.65.1.1 dev rn-ipip onlink metric 10
+for table in 51873 51874 51875; do
+    ip -4 route replace table "$table" unreachable default metric 32760
+done
+if ip link show dev exit-warp >/dev/null 2>&1; then
+    ip -4 route replace table 51873 default dev exit-warp metric 10
+fi
+ensure_rule 18570 fwmark 0x10000/0xf0000 lookup 51874
+ensure_rule 18571 fwmark 0x20000/0xf0000 lookup 51875
+ensure_rule 18572 fwmark 0x40000/0xf0000 lookup 51873
+ensure_rule 18573 oif exit-warp lookup 51873
+ensure_rule 18574 fwmark 0x80000/0xf0000 lookup main
+apply_policy
+
+docker_rules

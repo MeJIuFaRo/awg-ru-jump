@@ -1,0 +1,10 @@
+[Unit]
+Description=Reattach AmneziaWG client routing after Docker recreates the container
+After=awg-geo-base.service docker.service
+
+[Service]
+Type=oneshot
+ExecCondition=/usr/bin/systemctl is-active --quiet awg-geo-base.service
+ExecStart=/bin/sh -ec 'if systemctl is-active --quiet awg-geo-router.service; then exec /usr/local/lib/awg-geo/router reconcile; else exec systemctl start awg-geo-router.service; fi'
+ExecStart=/usr/local/lib/awg-geo/apply-data checkpoint
+TimeoutStartSec=65s

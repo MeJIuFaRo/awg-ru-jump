@@ -1,0 +1,11 @@
+#!/bin/sh
+# Return AmneziaWG clients to the original direct Russian route.
+set -eu
+systemctl disable --now awg-geo-reconcile.timer awg-geo-health.timer awg-geo-update.timer
+systemctl stop awg-geo-reconcile.service awg-geo-health.service awg-geo-update.service
+systemctl disable --now awg-geo-router.service
+if nft list table inet awg_geo >/dev/null 2>&1; then
+    /usr/local/lib/awg-geo/router stop
+fi
+systemctl disable --now awg-geo-dns.service awg-geo-base.service
+if nft list table inet awg_geo >/dev/null 2>&1; then nft delete table inet awg_geo; fi
