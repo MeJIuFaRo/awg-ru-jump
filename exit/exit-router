@@ -15,6 +15,9 @@ docker_rules() {
     done
 }
 action=${1:-apply}
+case "$action" in apply|down) ;; *) exit 1 ;; esac
+exec 9>/run/lock/exit-router.lock
+flock -x 9
 docker_rule() {
     set -- "$@" -m comment --comment exit-transit -j ACCEPT
     if iptables -w 5 -C DOCKER-USER "$@" 2>/dev/null; then
@@ -23,14 +26,64 @@ docker_rule() {
         iptables -w 5 -I DOCKER-USER 1 "$@"
     fi
 }
+scoped_rules() {
+    "$1" 18560 fwmark 0x10000/0xf0000 iif exit-warp lookup 51874
+    "$1" 18561 fwmark 0x10000/0xf0000 iif "$WAN_IF" lookup 51874
+    "$1" 18562 fwmark 0x20000/0xf0000 iif exit-warp lookup 51875
+    "$1" 18563 fwmark 0x20000/0xf0000 iif "$WAN_IF" lookup 51875
+    "$1" 18564 fwmark 0x40000/0xf0000 iif rn-gre lookup 51873
+    "$1" 18565 fwmark 0x40000/0xf0000 iif rn-ipip lookup 51873
+    "$1" 18566 fwmark 0x80000/0xf0000 iif rn-gre lookup 254
+    "$1" 18567 fwmark 0x80000/0xf0000 iif rn-ipip lookup 254
+    "$1" 18573 oif exit-warp lookup 51873
+}
+legacy_rules() {
+    "$1" 18570 fwmark 0x10000/0xf0000 lookup 51874
+    "$1" 18571 fwmark 0x20000/0xf0000 lookup 51875
+    "$1" 18572 fwmark 0x40000/0xf0000 lookup 51873
+    "$1" 18574 fwmark 0x80000/0xf0000 lookup 254
+}
+rule_lines() {
+    # Numeric table/protocol IDs also work with local aliases in rt_tables.
+    rows=$(ip -N -d -4 rule show pref "$@") || return 1
+    printf '%s\n' "$rows" | sed -E 's/^[[:space:]]*[0-9]+:[[:space:]]+//; s/ \[detached\]//g; s/[[:space:]]+$//'
+}
+ensure_rule() {
+    pref=$1
+    shift
+    rows=$(rule_lines "$pref")
+    if [ -z "$rows" ]; then
+        if [ "$phase" = update ]; then ip -4 rule add pref "$pref" "$@"; fi
+    elif [ "$rows" != "from all $* proto 0" ]; then
+        echo "Another routing rule uses priority $pref" >&2
+        exit 1
+    fi
+}
+remove_rule() {
+    pref=$1
+    shift
+    # An ip rule del with omitted selectors also matches narrower rules.
+    # Delete only exact leading matches among the kernel's candidates.
+    rows=$(rule_lines "$pref" "$@")
+    count=$(printf '%s\n' "$rows" | awk -v expected="from all $* proto 0" '
+        $0 == expected { if (other) exit 1; n++; next } {other=1} END {print n+0}') ||
+        { echo "Ambiguous deletion at rule priority $pref; inspect ip -d -4 rule show pref $pref" >&2; exit 1; }
+    if [ "$phase" = update ]; then
+        while [ "$count" -gt 0 ]; do
+            ip -4 rule del pref "$pref" "$@"
+            count=$((count - 1))
+        done
+    fi
+}
+phase=check
+legacy_rules remove_rule
 if [ "$action" = down ]; then
+    scoped_rules remove_rule
+    phase=update
+    legacy_rules remove_rule
+    scoped_rules remove_rule
     docker_rules
     if nft list table ip exit_transit >/dev/null 2>&1; then nft delete table ip exit_transit; fi
-    ip -4 rule del pref 18570 fwmark 0x10000/0xf0000 lookup 51874 2>/dev/null || :
-    ip -4 rule del pref 18571 fwmark 0x20000/0xf0000 lookup 51875 2>/dev/null || :
-    ip -4 rule del pref 18572 fwmark 0x40000/0xf0000 lookup 51873 2>/dev/null || :
-    ip -4 rule del pref 18573 oif exit-warp lookup 51873 2>/dev/null || :
-    ip -4 rule del pref 18574 fwmark 0x80000/0xf0000 lookup main 2>/dev/null || :
     ip -4 route del table 51873 default dev exit-warp metric 10 2>/dev/null || :
     ip -4 route del table 51874 default via 100.65.2.1 dev rn-gre metric 10 2>/dev/null || :
     ip -4 route del table 51875 default via 100.65.1.1 dev rn-ipip metric 10 2>/dev/null || :
@@ -39,7 +92,6 @@ if [ "$action" = down ]; then
     done
     exit 0
 fi
-[ "$action" = apply ]
 [ "$(cat /proc/sys/net/ipv4/ip_forward)" = 1 ]
 
 apply_policy() {
@@ -47,19 +99,8 @@ apply_policy() {
 }
 apply_policy -c
 
-ensure_rule() {
-    pref=$1
-    shift
-    existing=$(ip -4 rule show pref "$pref")
-    if [ -z "$existing" ]; then
-        ip -4 rule add pref "$pref" "$@"
-    elif ! printf '%s\n' "$existing" | awk -v expected="from all $*" '
-        {sub(/^[[:space:]]*[0-9]+:[[:space:]]*/, ""); sub(/[[:space:]]+\[detached\]/,""); sub(/[[:space:]]+$/, "")}
-        $0 != expected {bad=1} END {exit bad || NR!=1}'; then
-        echo "Another routing rule uses priority $pref" >&2
-        exit 1
-    fi
-}
+scoped_rules ensure_rule
+phase=update
 ip -4 route replace table 51874 default via 100.65.2.1 dev rn-gre onlink metric 10
 ip -4 route replace table 51875 default via 100.65.1.1 dev rn-ipip onlink metric 10
 for table in 51873 51874 51875; do
@@ -68,11 +109,8 @@ done
 if ip link show dev exit-warp >/dev/null 2>&1; then
     ip -4 route replace table 51873 default dev exit-warp metric 10
 fi
-ensure_rule 18570 fwmark 0x10000/0xf0000 lookup 51874
-ensure_rule 18571 fwmark 0x20000/0xf0000 lookup 51875
-ensure_rule 18572 fwmark 0x40000/0xf0000 lookup 51873
-ensure_rule 18573 oif exit-warp lookup 51873
-ensure_rule 18574 fwmark 0x80000/0xf0000 lookup main
+scoped_rules ensure_rule
+legacy_rules remove_rule
 apply_policy
 
 docker_rules

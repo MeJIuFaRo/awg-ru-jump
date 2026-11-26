@@ -1,5 +1,6 @@
 add table ip exit_transit
-delete table ip exit_transit
+# Flush chain rules in this transaction, retaining the health timer's named set.
+flush table ip exit_transit
 table ip exit_transit {
     set warp_ingress {
         type ifname
