@@ -99,7 +99,33 @@ sudo wg-quick strip /etc/wireguard/exit-warp.conf >/dev/null
 sudo systemctl enable --now wg-quick@exit-warp.service
 ```
 
-При регистрации wgcf покажет условия WARP и запросит их принятие. У каждого узла свой профиль. Каталог `/etc/ru-exit/wgcf` и файл `/etc/wireguard/exit-warp.conf` содержат секреты. Генератор извлекает IPv4-адрес и ключи зарегистрированного устройства, определяет IPv4 endpoint, выставляет `Table = off`, `AllowedIPs = 0.0.0.0/0`, MTU 1280 и keepalive 25 секунд. Он завершится с ошибкой при существующем целевом файле. Для смены endpoint сохраните профиль под другим закрытым именем, проверьте его и замените действующий файл во время обслуживания. WARP должен иметь исходящий доступ по UDP к выбранному endpoint.
+При регистрации wgcf покажет условия WARP и запросит их принятие. У каждого узла свой профиль. Каталог `/etc/ru-exit/wgcf` и файл `/etc/wireguard/exit-warp.conf` содержат секреты. Генератор извлекает IPv4-адрес и ключи зарегистрированного устройства, проверяет наличие IPv4-адреса endpoint и сохраняет указанное в исходнике имя или IPv4 вместе с портом, выставляет `Table = off`, `AllowedIPs = 0.0.0.0/0`, MTU 1280 и keepalive 25 секунд. Он завершится с ошибкой при существующем целевом файле. WARP должен иметь исходящий доступ по UDP к выбранному endpoint.
+
+### Обновление endpoint после отказа wgcf
+
+Если проверка wgcf перестала получать подтверждение WARP, основной монитор сразу выбирает исправный MASQUE или WAN. Отдельный таймер раз в минуту проверяет, остался ли wgcf в списке недоступных путей. Когда служба WireGuard активна, обработчик заново разрешает имя endpoint через системный DNS узла (IPv4). При одном новом A-адресе он выбирает этот адрес. При нескольких выбирает следующий за текущим в отсортированном списке и сохраняет настроенный UDP-порт. Перед сменой адреса ещё раз проверяется доступность WARP через основной интерфейс. Если он уже восстановился, переключение адреса пропускается.
+
+Обновляется только endpoint существующего пира командой `wg set`. Интерфейс, ключи и маршруты остаются на месте. Контроллер вернёт новые соединения на wgcf после успешной HTTPS-пробы. При ошибке DNS или единственном прежнем адресе действующий endpoint сохраняется; таймер попробует снова, пока продолжается отказ. Остановленный вручную интерфейс обработчик не поднимает.
+
+У прежних установок `/etc/wireguard/exit-warp.conf` может содержать только числовой IPv4. Обработчик берёт DNS-имя из `/etc/ru-exit/wgcf/wgcf-profile.conf` при совпадении публичного ключа пира, а порт — из действующей конфигурации. Поэтому сохраните исходный профиль. Если оба профиля содержат только IP или подходящее имя отсутствует, автоматической DNS-замены не будет.
+
+```sh
+sudo install -m 0755 exit/refresh-wgcf-endpoint /usr/local/sbin/
+sudo install -m 0644 exit/exit-endpoint-refresh.service exit/exit-endpoint-refresh.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now exit-endpoint-refresh.timer
+```
+
+На существующем узле с уже работающим автоматическим выбором выхода достаточно этого блока. Проверить настройку можно без вывода ключей:
+
+```sh
+sudo grep -E '^[[:space:]]*Endpoint[[:space:]]*=' /etc/wireguard/exit-warp.conf
+sudo wg show exit-warp endpoints | cut -f2
+sudo systemctl list-timers exit-endpoint-refresh.timer
+sudo journalctl -u exit-endpoint-refresh.service -n 20 --no-pager
+```
+
+При ручном `systemctl reload wg-quick@exit-warp` служба перечитывает профиль: имя разрешится повторно, числовой адрес будет использован как записан. Полный перезапуск также пересоздаёт интерфейс. В проверенной сборке штатная служба устанавливает `WG_ENDPOINT_RESOLUTION_RETRIES=infinity`. У отдельной службы восстановления есть лимит 15 секунд, поэтому сбой DNS не задерживает выбор MASQUE или WAN.
 
 ### Подготовить второй выход
 
@@ -177,8 +203,8 @@ sudo nft list chain ip exit_transit nat
 Сначала остановите на узле в РФ компоненты клиентской маршрутизации, использующие nexthop 65100–65102. На зарубежном узле отключите монитор, удалите правила из пакета и остановите WARP:
 
 ```sh
-sudo systemctl disable --now exit-health.timer
-sudo systemctl stop exit-health.service
+sudo systemctl disable --now exit-endpoint-refresh.timer exit-health.timer
+sudo systemctl stop exit-endpoint-refresh.service exit-health.service
 sudo systemctl disable --now exit-router.service
 sudo /usr/local/sbin/exit-router down
 sudo systemctl disable --now wg-quick@exit-warp.service

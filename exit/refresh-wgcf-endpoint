@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""Refresh one existing WireGuard peer using the configured endpoint hostname."""
+import ipaddress
+import json
+import re
+import socket
+import subprocess
+import sys
+from pathlib import Path
+
+
+def matching_endpoint(path, public_key):
+    """Read only peer identities and endpoints; require one unambiguous match."""
+    peers = []
+    section = None
+    with path.open(encoding="utf-8-sig") as profile:
+        for raw in profile:
+            line = raw.partition("#")[0].strip()
+            if line.startswith("["):
+                section = None
+                if line.lower() == "[peer]":
+                    section = {}
+                    peers.append(section)
+            elif section is not None:
+                field, sep, value = line.partition("=")
+                field = field.strip().lower()
+                if sep and field in ("publickey", "endpoint"):
+                    section.setdefault(field, []).append(value.strip())
+    matches = [peer for peer in peers if public_key in peer.get("publickey", [])]
+    if len(matches) != 1:
+        return None
+    peer = matches[0]
+    if peer["publickey"] != [public_key] or len(peer.get("endpoint", [])) != 1:
+        return None
+    host, sep, port = peer["endpoint"][0].rpartition(":")
+    if not sep or not host or ":" in host or not re.fullmatch(r"[0-9]{1,5}", port):
+        return None
+    if not 1 <= int(port) <= 65535:
+        return None
+    return host, int(port)
+
+
+def numeric_host(host):
+    try:
+        socket.inet_aton(host)
+    except OSError:
+        return False
+    return True
+
+
+def live_peer(interface):
+    devices = json.loads(subprocess.check_output(
+        ["ip", "-j", "link", "show"], stderr=subprocess.DEVNULL))
+    if not any(link["ifname"] == interface and "UP" in link["flags"] for link in devices):
+        return None
+    result = subprocess.run(["wg", "show", interface, "endpoints"], text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    if result.returncode:
+        # A manually stopped interface is an expected state for the timer.
+        if interface not in subprocess.check_output(
+                ["wg", "show", "interfaces"], text=True, stderr=subprocess.DEVNULL).split():
+            return None
+        raise RuntimeError("Cannot read live peer")
+    rows = result.stdout.splitlines()
+    if len(rows) == 1:
+        fields = rows[0].split()
+        if len(fields) == 2:
+            return tuple(fields)
+    return None
+
+
+def warp_recovered(interface):
+    for address in ("1.1.1.1", "1.0.0.1"):
+        probe = subprocess.run(
+            ["curl", "--disable", "--noproxy", "*", "--proto", "=https", "-4fsS",
+             "--interface", f"if!{interface}", "--connect-timeout", "1", "--max-time", "2",
+             f"https://{address}/cdn-cgi/trace"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        if probe.returncode == 0 and any(line in (b"warp=on", b"warp=plus")
+                                         for line in probe.stdout.splitlines()):
+            return True
+    return False
+
+
+def refresh(interface, config, source):
+    if interface in ("all", "interfaces") or not re.fullmatch(r"[a-zA-Z0-9_=+.-]{1,15}", interface):
+        raise ValueError("Invalid interface")
+    live = live_peer(interface)
+    if live is None:
+        return
+    public_key, current = live
+    configured = matching_endpoint(config, public_key)
+    if configured is None:
+        return
+    host, port = configured
+    if numeric_host(host):
+        try:
+            original = matching_endpoint(source, public_key)
+        except FileNotFoundError:
+            return
+        if original is None or numeric_host(original[0]):
+            return
+        host = original[0]
+
+    answers = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_DGRAM)
+    candidates = sorted({ipaddress.IPv4Address(answer[4][0]) for answer in answers})
+    if not candidates:
+        raise OSError("No IPv4 endpoint")
+    next_ip = candidates[0]
+    for index, address in enumerate(candidates):
+        if str(address) == current.rpartition(":")[0]:
+            next_ip = candidates[(index + 1) % len(candidates)]
+            break
+    endpoint = f"{next_ip}:{port}"
+    # The health timer's previous failure may already have cleared.
+    if endpoint == current or warp_recovered(interface):
+        return
+    # DNS and probes may take time; leave a changed peer or roaming endpoint alone.
+    if live_peer(interface) != live:
+        return
+    subprocess.run(["wg", "set", interface, "peer", public_key, "endpoint", endpoint],
+                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    print("Updated WireGuard peer endpoint")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 4:
+        sys.exit("Usage: refresh-wgcf-endpoint INTERFACE WG_QUICK_CONFIG WGCF_SOURCE_PROFILE")
+    try:
+        refresh(sys.argv[1], Path(sys.argv[2]), Path(sys.argv[3]))
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+        sys.exit("Endpoint refresh failed; check the interface, profiles and IPv4 DNS")

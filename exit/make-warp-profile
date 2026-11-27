@@ -23,11 +23,12 @@ def main():
     addresses = (ipaddress.ip_interface(item.strip()) for row in iface["Address"] for item in row.split(","))
     ipv4 = next(addr for addr in addresses if addr.version == 4)
     host, port = peer["Endpoint"][0].rsplit(":", 1)
-    endpoint = socket.getaddrinfo(host, int(port), socket.AF_INET, socket.SOCK_DGRAM)[0][4][0]
+    # Validate IPv4 availability but retain a supplied hostname for future re-resolution.
+    socket.getaddrinfo(host, int(port), socket.AF_INET, socket.SOCK_DGRAM)
     lines = [
         "[Interface]", f"PrivateKey = {iface['PrivateKey'][0]}", f"Address = {ipv4}",
         "MTU = 1280", "Table = off", "", "[Peer]", f"PublicKey = {peer['PublicKey'][0]}",
-        f"Endpoint = {endpoint}:{port}", "AllowedIPs = 0.0.0.0/0", "PersistentKeepalive = 25",
+        f"Endpoint = {host}:{port}", "AllowedIPs = 0.0.0.0/0", "PersistentKeepalive = 25",
     ]
     # Publish only a complete file, refusing to overwrite a previous identity.
     with tempfile.NamedTemporaryFile(mode="w", dir=target.parent) as out:

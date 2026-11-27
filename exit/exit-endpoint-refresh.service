@@ -1,0 +1,16 @@
+[Unit]
+Description=Refresh the wgcf peer endpoint after a failed WARP probe
+After=exit-health.service
+
+[Service]
+Type=oneshot
+ExecCondition=/usr/bin/systemctl is-active --quiet exit-health.timer
+ExecCondition=/usr/bin/systemctl is-active --quiet wg-quick@exit-warp.service
+ExecCondition=/usr/bin/python3 -c 'import json,sys; from pathlib import Path; p=Path("/run/exit-transit-health.json"); sys.exit(0 if p.is_file() and "wgcf" in json.loads(p.read_text())["failed"] else 1)'
+ExecStart=/usr/local/sbin/refresh-wgcf-endpoint exit-warp /etc/wireguard/exit-warp.conf /etc/ru-exit/wgcf/wgcf-profile.conf
+TimeoutStartSec=15s
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
