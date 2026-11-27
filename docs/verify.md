@@ -24,7 +24,7 @@ ip -4 route show default
 wg show exit-warp latest-handshakes
 curl --noproxy '*' -4fsS --max-time 8 --interface exit-warp https://1.1.1.1/cdn-cgi/trace | grep -E '^(ip|warp)='
 curl --noproxy '*' -4fsS --max-time 8 https://1.1.1.1/cdn-cgi/trace | grep -E '^(ip|warp)='
-nft list set ip exit_transit warp_ingress
+sudo /usr/local/sbin/exit-health status
 ```
 
 Первая проверка `curl` должна показать `warp=on` или `warp=plus`, вторая — обычный публичный адрес зарубежного узла. При доступном WARP в `warp_ingress` появятся `rn-ipip` и `rn-gre`. Внешний адрес Cloudflare может меняться.
@@ -46,7 +46,7 @@ dig @172.29.172.254 _dns.dns.google SVCB +tcp +short
 Чтобы подтвердить выбор DNS-провайдера, наблюдайте запросы при пустом кэше или используйте новое имя в нужной зоне. Запрашивайте имена по очереди. Внешний канал зашифрован, поэтому сопоставляйте время запроса, направление и адрес назначения.
 
 - На внешнем интерфейсе РФ должны появиться соединения на TCP/853 к `77.88.8.8` или `77.88.8.1` для имён из `CATEGORY-RU`.
-- Для обычного внешнего домена на мосту Amnezia виден обмен контейнера Unbound с `1.1.1.1:853` или `1.0.0.1:853`. Пакеты уходят через `rn-ipip` или `rn-gre`; на зарубежном узле видны на `exit-warp`. Сниффер запускайте до запроса и ограничивайте его адресом/портом и числом пакетов.
+- Для обычного внешнего домена на мосту Amnezia виден обмен контейнера Unbound с `1.1.1.1:853` или `1.0.0.1:853`. Пакеты уходят через `rn-ipip` или `rn-gre`; на зарубежном узле смотрите `exit-warp` при выборе wgcf и `cfw-host` при выборе MASQUE. Сниффер запускайте до запроса и ограничивайте его адресом/портом и числом пакетов.
 - Выбранный адрес из ответа на `ya.ru A` можно проверить на РФ командой `nft get element inet awg_geo ru_dns_a '{ АДРЕС }'` и такой же командой для `ru_dns_b`. Подставьте фактический IPv4. Сразу после нового ответа адрес должен находиться в обоих наборах.
 
 ## 3. Проверить настоящий маршрут
@@ -81,17 +81,39 @@ curl --noproxy '*' -4fsS --max-time 8 https://1.1.1.1/cdn-cgi/trace | grep -E '^
 
 ## 4. Проверить автоматическое переключение
 
-Проводите испытания на выделенной установке или в согласованное окно. Временно блокируйте **только контрольные запросы** выбранного пути, а затем снимайте временное правило. На РФ для проб используются метки `0x41570101` (IPIP) и `0x41570102` (GRE), адрес `1.1.1.1`, TCP/443. На зарубежном узле тест WARP обращается к Cloudflare с привязкой к `exit-warp`.
+Логику выбора выхода можно проверить локально на Linux до запуска служб: `python3 -B -m unittest discover -s exit -p 'test_exit_health.py'`. Для проверки сквозного маршрута используйте шаги ниже.
 
-| Состояние | Ожидаемый результат нового запроса клиента к Cloudflare |
-|---|---|
-| Недоступна проверка только IPIP | РФ выбирает `65102`, запрос проходит через GRE |
-| Недоступна проверка только GRE | РФ выбирает `65101`, запрос проходит через IPIP |
-| Недоступны обе проверки на РФ | Запрос получает обычный публичный адрес РФ |
-| Доступен зарубежный узел, не проходит проверка WARP | Запрос получает публичный адрес зарубежного узла |
-| Проверки восстановлены | Новый запрос показывает `warp=on` или `warp=plus`, возвращается группа `65100` |
+Проводите эту проверку на тестовой установке или в согласованное окно. На зарубежном узле следующие правила блокируют исходящие локальные запросы к контрольным HTTPS-адресам по выбранному WARP-пути. Таймер реагирует на них как на отказ: выбор выхода меняется для новых клиентских соединений, а работавшие через объявленный недоступным путь потоки UDP/ICMP могут получить новую трансляцию. Элементы тестового набора истекают через две минуты.
 
-На РФ смотрите `cat /run/awg-geo/health.json`, `ip -4 route show table 61570` и `journalctl -u awg-geo-health.service -n 20`. На зарубежном узле — `journalctl -u exit-health.service -n 20` и `nft list set ip exit_transit warp_ingress`.
+```sh
+# Имя таблицы должно быть свободно.
+sudo nft -f - <<'NFT'
+create table ip exit_probe_drill
+add set ip exit_probe_drill blocked { type ifname; flags timeout; timeout 2m; }
+add chain ip exit_probe_drill output { type filter hook output priority -10; policy accept; }
+add rule ip exit_probe_drill output oifname @blocked ip daddr { 1.1.1.1, 1.0.0.1 } tcp dport 443 counter reject with tcp reset
+NFT
+```
+
+На каждом шаге дождитесь следующей проверки или вызовите `sudo systemctl start exit-health.service`. Выполните `sudo /usr/local/sbin/exit-health status` на зарубежном узле и откройте **новое** соединение с клиента к `https://1.1.1.1/cdn-cgi/trace`.
+
+| Шаг | Команда на зарубежном узле | Ожидаемый `effective_backend` | Ответ клиенту |
+|---|---|---|---|
+| Оба пути исправны | Старт с пустым набором | `wgcf` | `warp=on` или `plus` |
+| Отказ wgcf | `sudo nft 'add element ip exit_probe_drill blocked { "exit-warp" }'` | `official` | WARP через MASQUE |
+| Отказ обоих | `sudo nft 'add element ip exit_probe_drill blocked { "cfw-host" }'` | `wan` | `warp=off`, публичный IP зарубежного WAN |
+| Восстановился MASQUE | `sudo nft 'delete element ip exit_probe_drill blocked { "cfw-host" }'` | `official` | WARP через MASQUE |
+| Восстановился wgcf | `sudo nft flush set ip exit_probe_drill blocked` | `wgcf` | Новое соединение через WireGuard |
+
+Для проверки фактического пути сравните счётчики `sudo nft list chain ip exit_transit nat` до и после нового соединения. В конце удалите временную таблицу и убедитесь, что монитор снова выбирает основной выход:
+
+```sh
+sudo nft delete table ip exit_probe_drill
+sudo systemctl start exit-health.service
+sudo /usr/local/sbin/exit-health status
+```
+
+Переключение **между серверами** проверяется отдельно. При отказе IPIP узел РФ должен выбрать GRE (`65102`), при отказе GRE — IPIP (`65101`), при потере обоих — прямой выход РФ. После восстановления обоих путей возвращается ECMP (`65100`). На РФ смотрите `/run/awg-geo/health.json`, `ip -4 route show table 61570` и журнал `awg-geo-health.service`. Его проверки используют метки `0x41570101` для IPIP и `0x41570102` для GRE.
 
 ## 5. Проверить обновления и автозапуск
 

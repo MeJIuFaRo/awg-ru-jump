@@ -1,41 +1,50 @@
 add table ip exit_transit
-# Flush chain rules in this transaction, retaining the health timer's named set.
+# Reload all chain rules together and retain the health timer's named sets.
 flush table ip exit_transit
 table ip exit_transit {
     set warp_ingress {
+        type ifname
+    }
+    set official_ingress {
         type ifname
     }
 
     chain classify {
         iifname "rn-gre" ct mark & 0x30000 == 0 ct mark set ct mark | 0x10000
         iifname "rn-ipip" ct mark & 0x30000 == 0 ct mark set ct mark | 0x20000
+        iifname @official_ingress ct mark & 0xc0000 == 0 ct mark set ct mark | 0xc0000
         iifname @warp_ingress ct mark & 0xc0000 == 0 ct mark set ct mark | 0x40000
         ct mark & 0xc0000 == 0 ct mark set ct mark | 0x80000
         ct mark & 0xc0000 == 0x40000 meta mark set (meta mark & 0xfff0ffff) | 0x40000
         ct mark & 0xc0000 == 0x80000 meta mark set (meta mark & 0xfff0ffff) | 0x80000
+        ct mark & 0xc0000 == 0xc0000 meta mark set (meta mark & 0xfff0ffff) | 0xc0000
     }
 
     chain preroute {
         type filter hook prerouting priority mangle; policy accept;
         iifname { "rn-ipip", "rn-gre" } ip saddr != { $clients, 100.65.1.1, 100.65.2.1 } counter drop
         iifname { "rn-ipip", "rn-gre" } ct direction original fib daddr type != local jump classify
-        iifname { $wan, "exit-warp" } ct direction reply ct mark & 0x30000 == 0x10000 meta mark set (meta mark & 0xfff0ffff) | 0x10000
-        iifname { $wan, "exit-warp" } ct direction reply ct mark & 0x30000 == 0x20000 meta mark set (meta mark & 0xfff0ffff) | 0x20000
+        iifname { $wan, "exit-warp", "cfw-host" } ct direction reply ct mark & 0x30000 == 0x10000 meta mark set (meta mark & 0xfff0ffff) | 0x10000
+        iifname { $wan, "exit-warp", "cfw-host" } ct direction reply ct mark & 0x30000 == 0x20000 meta mark set (meta mark & 0xfff0ffff) | 0x20000
     }
 
     chain forward {
         type filter hook forward priority -5; policy accept;
-        iifname { "rn-gre", "rn-ipip" } oifname != { $wan, "exit-warp" } counter drop
+        iifname { "rn-gre", "rn-ipip" } oifname != { $wan, "exit-warp", "cfw-host" } counter drop
+        iifname { "rn-gre", "rn-ipip" } ct mark & 0xc0000 == 0x40000 oifname != "exit-warp" counter drop
+        iifname { "rn-gre", "rn-ipip" } ct mark & 0xc0000 == 0xc0000 oifname != "cfw-host" counter drop
         iifname { "rn-gre", "rn-ipip" } ct state invalid counter drop
-        iifname "exit-warp" oifname != { "rn-ipip", "rn-gre" } counter drop
+        iifname { "exit-warp", "cfw-host" } oifname != { "rn-ipip", "rn-gre" } counter drop
+        iifname "cfw-host" ct direction != reply counter drop
         oifname { "rn-ipip", "rn-gre" } ct state != { established, related } counter drop
-        iifname { "rn-ipip", "rn-gre" } oifname { $wan, "exit-warp" } tcp flags & (syn | rst) == syn tcp option maxseg size > 1240 tcp option maxseg size set 1240
-        iifname { $wan, "exit-warp" } oifname { "rn-ipip", "rn-gre" } tcp flags & (syn | rst) == syn tcp option maxseg size > 1240 tcp option maxseg size set 1240
+        iifname { "rn-ipip", "rn-gre" } oifname { $wan, "exit-warp", "cfw-host" } tcp flags & (syn | rst) == syn tcp option maxseg size > 1240 tcp option maxseg size set 1240
+        iifname { $wan, "exit-warp", "cfw-host" } oifname { "rn-ipip", "rn-gre" } tcp flags & (syn | rst) == syn tcp option maxseg size > 1240 tcp option maxseg size set 1240
     }
 
     chain nat {
         type nat hook postrouting priority 99; policy accept;
         iifname { "rn-ipip", "rn-gre" } oifname "exit-warp" counter masquerade
+        iifname { "rn-ipip", "rn-gre" } oifname "cfw-host" counter snat to 10.254.247.1
         iifname { "rn-ipip", "rn-gre" } oifname $wan counter masquerade
     }
 }

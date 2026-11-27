@@ -1,33 +1,201 @@
-#!/bin/sh
-set -eu
-# A bound IPv4 socket uses rule 18573 and cannot silently probe the WAN.
-probe() {
-    for addr in 1.1.1.1 1.0.0.1; do
-        if curl --noproxy '*' -4fsS --interface if!exit-warp --connect-timeout 2 --max-time 3 \
-            "https://$addr/cdn-cgi/trace" 2>/dev/null | grep -Eq '^warp=(on|plus)$'; then
-            return 0
-        fi
-    done
-    return 1
-}
-was_up=0
-if nft 'get element ip exit_transit warp_ingress { "rn-gre" }' >/dev/null 2>&1; then was_up=1; fi
-if ip link show dev exit-warp >/dev/null 2>&1; then
-    ip -4 route replace table 51873 default dev exit-warp metric 10
-    if probe; then
-        if [ "$was_up" = 0 ]; then
-            nft 'add element ip exit_transit warp_ingress { "rn-gre", "rn-ipip" }'
-            echo 'New connections use WARP'
-        fi
-        exit 0
-    fi
-fi
-if [ "$was_up" = 1 ]; then
-    nft flush set ip exit_transit warp_ingress
-    for proto in udp icmp; do
-        for mark in 0x50000 0x60000; do
-            conntrack -D -f ipv4 -p "$proto" --mark "$mark/0xf0000" >/dev/null 2>&1 || :
-        done
-    done
-    echo 'New connections use the exit WAN'
-fi
+#!/usr/bin/env python3
+"""Choose the egress for new IPv4 transit connections."""
+import concurrent.futures
+import fcntl
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+
+TUNNELS = {"rn-gre", "rn-ipip"}
+SETS = {"wgcf": "warp_ingress", "official": "official_ingress"}
+MARKS = {"wgcf": ("0x50000", "0x60000"), "official": ("0xd0000", "0xe0000")}
+STATE = Path("/run/exit-transit-health.json")
+LOCK = Path("/run/lock/exit-router.lock")
+
+
+def run(args, *, data=None, check=True):
+    proc = subprocess.run(args, input=data, text=True, capture_output=True)
+    if check and proc.returncode:
+        raise RuntimeError(proc.stderr.strip() or f"{args[0]} exited with {proc.returncode}")
+    return proc
+
+
+def unavailable(proc):
+    if not proc.returncode:
+        return False
+    if any(reason in proc.stderr.lower() for reason in (
+            "does not exist", "no such device", "cannot find device", "network is unreachable",
+            "no route to host", "network is down")):
+        return True
+    raise RuntimeError(proc.stderr.strip() or "ip command failed")
+
+
+def repair_wgcf_route(device_up):
+    ip = ["ip", "-4"]
+    res = run(ip + ["-j", "route", "show", "table", "51873", "exact", "default"], check=False)
+    if res.returncode and "fib table does not exist" in res.stderr.lower():
+        rows = []
+    elif res.returncode:
+        raise RuntimeError(res.stderr.strip() or "cannot inspect table 51873")
+    else:
+        rows = json.loads(res.stdout)
+    if not any(r.get("type") == "unreachable" and r.get("metric") == 32760 for r in rows):
+        run(ip + ["route", "replace", "unreachable", "default", "metric", "32760", "table", "51873"])
+    if device_up and not any(r.get("dev") == "exit-warp" and r.get("metric") == 10 for r in rows):
+        res = run(ip + ["route", "replace", "default", "dev", "exit-warp", "metric", "10",
+                        "table", "51873"], check=False)
+        return not unavailable(res)
+    return device_up
+
+
+def probe(path):
+    dev = "exit-warp" if path == "wgcf" else "cfw-host"
+    res = run(["ip", "-4", "-j", "addr", "show", "dev", dev], check=False)
+    links = [] if unavailable(res) else json.loads(res.stdout)
+    sources = {a["local"] for link in links for a in link["addr_info"] if a["family"] == "inet"}
+    if path == "wgcf" and not repair_wgcf_route(bool(sources)):
+        return False, sources
+    if not sources:
+        return False, sources
+    if path == "official" and "10.254.247.1" not in sources:
+        return False, sources
+    for addr in ("1.1.1.1", "1.0.0.1"):
+        res = run(["ip", "-4", "-j", "route", "get", addr, "oif", dev], check=False)
+        if unavailable(res):
+            continue
+        route = json.loads(res.stdout)[0]
+        if route.get("dev") != dev:
+            continue
+        if path == "official" and route.get("gateway") != "10.254.247.2":
+            continue
+        res = run(["curl", "--noproxy", "*", "-4fsS", "--interface", "if!" + dev,
+                   "--connect-timeout", "2", "--max-time", "3", f"https://{addr}/cdn-cgi/trace"],
+                  check=False)
+        if res.returncode in (2, 4, 27, 43, 48, 77):
+            raise RuntimeError(res.stderr.strip() or f"curl configuration error {res.returncode}")
+        if not res.returncode and {"warp=on", "warp=plus"}.intersection(res.stdout.splitlines()):
+            return True, sources
+    return False, sources
+
+
+def selectors():
+    doc = json.loads(run(["nft", "-j", "list", "table", "ip", "exit_transit"]).stdout)
+    sets = {obj["set"]["name"]: set(obj["set"].get("elem", []))
+            for obj in doc["nftables"] if "set" in obj}
+    active = {path: sets[name] for path, name in SETS.items()}
+    if any(not devs <= TUNNELS for devs in active.values()):
+        raise RuntimeError("unexpected interface in exit_transit ingress sets")
+    return active
+
+
+def effective(active):
+    paths = {next((p for p in ("official", "wgcf") if dev in active[p]), "wan") for dev in TUNNELS}
+    return paths.pop() if len(paths) == 1 else "mixed"
+
+
+def select(active, chosen):
+    batch = []
+    for path, name in SETS.items():
+        wanted = TUNNELS if chosen == path else set()
+        if active[path] != wanted:
+            batch.append(f"flush set ip exit_transit {name}")
+            if wanted:
+                elements = ", ".join(json.dumps(dev) for dev in sorted(wanted))
+                batch.append(f"add element ip exit_transit {name} {{ {elements} }}")
+    if batch:
+        run(["nft", "-f", "-"], data="\n".join(batch) + "\n")
+        print(f"New connections use {chosen}", flush=True)
+
+
+def clear_datagrams(path, addresses):
+    for addr in sorted(addresses):
+        for proto in ("udp", "icmp"):
+            for mark in MARKS[path]:
+                proc = run(["conntrack", "-D", "-f", "ipv4", "-p", proto, "--mark", mark + "/0xf0000",
+                            "--src-nat", "--reply-dst", str(ipaddress.IPv4Address(addr))], check=False)
+                empty = re.fullmatch(r"conntrack(?: v[\w.-]+ \(conntrack-tools\))?: "
+                                     r"0 flow entries have been deleted\.", proc.stderr.strip())
+                if proc.returncode and not (proc.returncode == 1 and empty):
+                    raise RuntimeError(proc.stderr.strip() or f"conntrack cleanup failed on {path}")
+
+
+def profile_sources():
+    # An upgrade can meet an existing wgcf flow after wg-quick removed its
+    # interface but before this controller had a chance to record the address.
+    profile = Path("/etc/wireguard/exit-warp.conf")
+    if not profile.exists():
+        return set()
+    addresses = set()
+    section = ""
+    with profile.open() as stream:
+        for raw in stream:
+            line = raw.partition("#")[0].strip()
+            if line.startswith("["):
+                section = line
+            key, _, value = line.partition("=")
+            if section == "[Interface]" and key.strip() == "Address":
+                for item in value.split(","):
+                    iface = ipaddress.ip_interface(item.strip())
+                    if iface.version == 4:
+                        addresses.add(str(iface.ip))
+    return addresses
+
+
+def save(state):
+    with tempfile.NamedTemporaryFile(dir=STATE.parent, mode="w", delete=False) as out:
+        name = Path(out.name)
+        try:
+            json.dump(state, out, sort_keys=True)
+            out.flush()
+            os.replace(name, STATE)
+        finally:
+            name.unlink(missing_ok=True)
+
+
+def health():
+    active = selectors()
+    previous = json.loads(STATE.read_text()) if STATE.exists() else {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        results = dict(zip(SETS, pool.map(probe, SETS)))
+    failed = {path for path, (passed, _) in results.items() if not passed}
+    chosen = next((path for path in ("wgcf", "official") if path not in failed), "wan")
+    select(active, chosen)
+    wgcf_sources = set(previous.get("wgcf_sources", [])) | results["wgcf"][1]
+    for path in sorted(failed - set(previous.get("failed", []))):
+        if path == "wgcf" and not wgcf_sources:
+            wgcf_sources = profile_sources()
+        clear_datagrams(path, wgcf_sources if path == "wgcf" else {"10.254.247.1"})
+    state = {"failed": sorted(failed), "wgcf_sources": sorted(wgcf_sources)}
+    if state != previous:
+        save(state)
+
+
+def main():
+    if sys.argv[1:] not in ([], ["status"]):
+        raise ValueError("usage: exit-health [status]")
+    os.environ["LC_ALL"] = "C"
+    with LOCK.open("a") as lock:
+        if sys.argv[1:]:
+            fcntl.flock(lock, fcntl.LOCK_SH)
+            active = selectors()
+            print(json.dumps({"backend": "auto", "effective_backend": effective(active),
+                              "eligible_ingress": {SETS[p]: sorted(devs) for p, devs in active.items()}},
+                             sort_keys=True))
+            return
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        health()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, KeyError, RuntimeError) as exc:
+        sys.exit(str(exc))

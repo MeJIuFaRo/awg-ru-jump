@@ -8,7 +8,7 @@ docker_rules() {
     command -v iptables >/dev/null && iptables -w 5 -S DOCKER-USER >/dev/null 2>&1 || return 0
     for tunnel in rn-ipip rn-gre; do
         case "$tunnel" in rn-ipip) mark=0x20000 ;; rn-gre) mark=0x10000 ;; esac
-        for uplink in "$WAN_IF" exit-warp; do
+        for uplink in "$WAN_IF" exit-warp cfw-host; do
             docker_rule -i "$tunnel" -o "$uplink" -m conntrack --ctdir ORIGINAL --ctstate NEW,ESTABLISHED,RELATED -m connmark --mark "$mark/0x30000"
             docker_rule -i "$uplink" -o "$tunnel" -m conntrack --ctdir REPLY --ctstate ESTABLISHED,RELATED -m connmark --mark "$mark/0x30000"
         done
@@ -27,6 +27,10 @@ docker_rule() {
     fi
 }
 scoped_rules() {
+    "$1" 18555 fwmark 0xc0000/0xf0000 iif rn-gre lookup 51876
+    "$1" 18556 fwmark 0xc0000/0xf0000 iif rn-ipip lookup 51876
+    "$1" 18557 fwmark 0x10000/0xf0000 iif cfw-host lookup 51874
+    "$1" 18558 fwmark 0x20000/0xf0000 iif cfw-host lookup 51875
     "$1" 18560 fwmark 0x10000/0xf0000 iif exit-warp lookup 51874
     "$1" 18561 fwmark 0x10000/0xf0000 iif "$WAN_IF" lookup 51874
     "$1" 18562 fwmark 0x20000/0xf0000 iif exit-warp lookup 51875
@@ -90,6 +94,7 @@ if [ "$action" = down ]; then
     for table in 51873 51874 51875; do
         ip -4 route del table "$table" unreachable default metric 32760 2>/dev/null || :
     done
+    rm -f /run/exit-transit-health.json
     exit 0
 fi
 [ "$(cat /proc/sys/net/ipv4/ip_forward)" = 1 ]

@@ -1,0 +1,9 @@
+[Unit]
+Description=Reconcile the transit link to the isolated official WARP client
+Requires=docker.service
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/ru-exit-official/gateway
+TimeoutStartSec=25s

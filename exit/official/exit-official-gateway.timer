@@ -1,0 +1,11 @@
+[Unit]
+Description=Restore the WARP transit link after a container restart
+
+[Timer]
+OnBootSec=8s
+OnUnitInactiveSec=8s
+AccuracySec=1s
+Unit=exit-official-gateway.service
+
+[Install]
+WantedBy=timers.target

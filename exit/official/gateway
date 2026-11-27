@@ -1,0 +1,157 @@
+#!/bin/sh
+set -eu
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+owner=exit-official-gateway
+container=exit-official-warp
+lib=/usr/local/lib/ru-exit-official
+runtime=/run/ru-exit-official
+proto=247
+action=${1:-apply}
+case "$action" in apply|down) ;; *) exit 2 ;; esac
+install -d -m 0700 "$runtime"
+exec 9>"$runtime/gateway.lock"
+flock -x -w 10 9
+fail() { echo "$*" >&2; exit 1; }
+host() { "$@"; }
+ns() { nsenter --net="/proc/$$/fd/8" -- "$@"; }
+inspect_container() {
+    docker inspect --type container -f '{{.State.Pid}} {{.HostConfig.NetworkMode}} {{.Id}}' "$container"
+}
+pin_namespace() {
+    if ! item=$(inspect_container 2>/dev/null); then
+        # A missing optional container is normal; a failed Docker daemon is not.
+        ids=$(docker container ls --all --quiet --filter "name=^/$container$") || return 1
+        [ -n "$ids" ] || return 3
+        return 1
+    fi
+    # Docker prints exactly one PID, network mode and container ID.
+    set -- $item
+    [ "$#" = 3 ] || return 1
+    [ "$1" != 0 ] || return 3
+    [ "$1" -gt 1 ] && [ "$2" = bridge ] || return 1
+    exec 8<"/proc/$1/ns/net"
+    namespace=$(readlink "/proc/$$/fd/8")
+    [ "$namespace" != "$(readlink /proc/self/ns/net)" ] || fail 'Refusing host network namespace'
+    [ "$(inspect_container)" = "$item" ] || fail 'Container changed during inspection'
+}
+rule() {
+    context=$1 priority=$2
+    shift 2
+    rows=$("$context" ip -N -d -4 rule show pref "$priority")
+    line=$(printf '%s\n' "$rows" | sed -E 's/^[[:space:]]*[0-9]+:[[:space:]]*//;s/ \[detached\]//g;s/[[:space:]]+$//')
+    if [ -z "$line" ]; then
+        if [ "$action" = apply ]; then "$context" ip -4 rule add pref "$priority" "$@" protocol "$proto"; fi
+    elif [ "$line" = "from all $* proto $proto" ]; then
+        if [ "$action" = down ]; then "$context" ip -4 rule del pref "$priority" "$@" protocol "$proto"; fi
+    elif [ "$action" = apply ]; then
+        fail "Foreign policy rule at priority $priority"
+    else
+        # Never run a partially matching deletion at a shared priority.
+        case "$line" in *"from all $* proto $proto"*) fail "Shared rule priority $priority" ;; esac
+    fi
+}
+check_table() {
+    routes=$("$1" ip -N -4 route show table all)
+    printf '%s\n' "$routes" | awk -v t="$2" -v p="$proto" '
+        {s=" "$0" "; if (index(s," table "t" ") && !index(s," proto "p" ")) exit 1}' ||
+        fail "Foreign routes in reserved table $2"
+}
+owned_link() {
+    details=$("$1" ip -j -d link show dev "$2") || return 1
+    printf '%s\n' "$details" | python3 -c '
+import json, sys
+link, = json.load(sys.stdin)
+sys.exit(not (link.get("ifalias") == sys.argv[1] and link.get("linkinfo", {}).get("info_kind") == "veth"))
+' "$owner"
+}
+remove_host_link() {
+    if ip link show dev cfw-host >/dev/null 2>&1; then
+        owned_link host cfw-host || fail 'Foreign cfw-host'
+        ip link del dev cfw-host
+    fi
+}
+host_rule() { rule host 18554 oif cfw-host lookup 51876; }
+inside_rules() {
+    rule ns 220 to 10.254.247.1 iif CloudflareWARP lookup 254
+    rule ns 221 iif cfw-in lookup 51907
+}
+if [ "$action" = down ]; then
+    # Keep the guard in place until removing the transit link.
+    remove_host_link
+    host_rule
+    ip -4 route del table 51876 unreachable default metric 32760 proto "$proto" 2>/dev/null || :
+    if pin_namespace; then
+        inside_rules
+        ns ip -4 route del table 51907 default dev CloudflareWARP metric 10 proto "$proto" 2>/dev/null || :
+        ns ip -4 route del table 51907 unreachable default metric 32760 proto "$proto" 2>/dev/null || :
+        if ns nft list table inet exit_official_forward 2>/dev/null | grep -Fq 'comment "exit-official-gateway"'; then
+            ns nft delete table inet exit_official_forward
+        fi
+    else
+        [ "$?" = 3 ] || fail 'Cannot inspect the container namespace for cleanup'
+    fi
+    rm -f "$runtime/namespace" "$runtime/policy"
+    exit 0
+fi
+
+[ "$(sysctl -n net.ipv4.ip_forward)" = 1 ] || fail 'Host IPv4 forwarding is disabled'
+check_table host 51876
+ip -4 route replace table 51876 unreachable default metric 32760 proto "$proto"
+host_rule
+if pin_namespace; then
+    :
+else
+    [ "$?" = 3 ] || fail 'Cannot inspect exit-official-warp on the Docker bridge'
+    # Removing the owned veth also withdraws its route. Keep the unreachable
+    # default and scoped probe rule, ready for the next container start.
+    remove_host_link
+    exit 0
+fi
+check_table ns 51907
+
+previous=$(cat "$runtime/namespace" 2>/dev/null || :)
+if ip link show dev cfw-host >/dev/null 2>&1; then
+    owned_link host cfw-host || fail 'Foreign cfw-host'
+    if ! ns ip link show dev cfw-in >/dev/null 2>&1; then
+        # A process can keep the previous Docker namespace and veth alive.
+        [ -n "$previous" ] && [ "$previous" != "$namespace" ] || fail 'Transit peer is missing'
+        ip link del dev cfw-host
+    fi
+fi
+if ! ip link show dev cfw-host >/dev/null 2>&1; then
+    if ns ip link show dev cfw-in >/dev/null 2>&1; then fail 'Container name cfw-in is occupied'; fi
+    ip link add cfw-host type veth peer name cfw-in netns "/proc/$$/fd/8"
+    ip link set dev cfw-host alias "$owner"
+    ns ip link set dev cfw-in alias "$owner"
+fi
+owned_link ns cfw-in || fail 'Foreign cfw-in'
+printf '%s\n' "$namespace" > "$runtime/namespace"
+
+# Enforce forwarding restrictions before bringing up the transit link. Stateless
+# output ignores counter changes but detects externally flushed or altered rules.
+policy_stamp() {
+    printf '%s\n' "$namespace" "$policy_file_hash" "$current_policy" | sha256sum
+}
+policy_file_hash=$(sha256sum "$lib/inside.nft")
+if current_policy=$(ns nft -s list table inet exit_official_forward 2>/dev/null); then
+    printf '%s\n' "$current_policy" | grep -Fq 'comment "exit-official-gateway"' || fail 'Foreign nftables table'
+else
+    current_policy=
+fi
+if [ -z "$current_policy" ] || [ "$(cat "$runtime/policy" 2>/dev/null || :)" != "$(policy_stamp)" ]; then
+    ns nft -f "$lib/inside.nft"
+    current_policy=$(ns nft -s list table inet exit_official_forward)
+    policy_stamp > "$runtime/policy"
+fi
+ns ip -4 route replace table 51907 unreachable default metric 32760 proto "$proto"
+inside_rules
+ns sysctl -qw net.ipv4.ip_forward=1
+ip -4 addr replace 10.254.247.1/30 dev cfw-host
+ns ip -4 addr replace 10.254.247.2/30 dev cfw-in
+ns ip link set dev cfw-in mtu 1280 up
+ip link set dev cfw-host mtu 1280 up
+if ns ip link show dev CloudflareWARP >/dev/null 2>&1; then
+    ns ip -4 route replace table 51907 default dev CloudflareWARP metric 10 proto "$proto"
+fi
+[ "$(inspect_container)" = "$item" ] || fail 'Container changed during reconciliation'
+ip -4 route replace table 51876 default via 10.254.247.2 dev cfw-host metric 10 proto "$proto"

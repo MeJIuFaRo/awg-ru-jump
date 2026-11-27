@@ -1,0 +1,20 @@
+add table inet exit_official_forward
+delete table inet exit_official_forward
+table inet exit_official_forward {
+    comment "exit-official-gateway"
+    chain forward_guard {
+        type filter hook forward priority -10; policy accept;
+        iifname "cfw-in" meta nfproto != ipv4 counter drop
+        iifname "cfw-in" ip saddr != 10.254.247.1 counter drop
+        iifname "cfw-in" oifname != "CloudflareWARP" counter drop
+        oifname "cfw-in" meta nfproto != ipv4 counter drop
+        oifname "cfw-in" iifname != "CloudflareWARP" counter drop
+        oifname "cfw-in" ct state != { established, related } counter drop
+        iifname "cfw-in" oifname "CloudflareWARP" counter
+        iifname "CloudflareWARP" oifname "cfw-in" counter
+    }
+    chain nat {
+        type nat hook postrouting priority 90; policy accept;
+        iifname "cfw-in" oifname "CloudflareWARP" ip saddr 10.254.247.1 counter masquerade
+    }
+}

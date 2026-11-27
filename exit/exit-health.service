@@ -6,3 +6,4 @@ After=exit-router.service
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/exit-health
+TimeoutStartSec=12s
