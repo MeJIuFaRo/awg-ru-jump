@@ -47,15 +47,13 @@ sudo docker inspect --type container \
 ## Как выбирается выход в примере с GRE и IPIP
 
 ```mermaid
-flowchart LR
-    client["Клиент AmneziaWG"] --> ingress["Узел РФ · проверка IP назначения"]
-    ingress -->|"GeoIP:RU или IP из DNS для CATEGORY-RU"| ru_wan["Интернет через РФ"]
-    ingress -->|"Остальные адреса · ECMP"| overlay["IPIP или GRE"]
-    overlay --> exit_node["Зарубежный узел"]
-    exit_node -->|"wgcf доступен"| warp["WARP · WireGuard"]
-    exit_node -->|"wgcf недоступен, MASQUE доступен"| masque["WARP · официальный клиент"]
-    exit_node -->|"Оба WARP недоступны"| wan["Интернет через зарубежный WAN"]
-    ingress -.->|"Потеря обоих туннелей"| ru_wan
+flowchart TD
+    client["Клиент AmneziaWG"] --> ingress["Узел РФ"]
+    ingress --> direct["IP в GeoIP:RU,<br/>IP из DNS для CATEGORY-RU<br/>или оба туннеля недоступны"]
+    ingress --> transit["Остальной публичный IPv4<br/>при доступном туннеле"]
+    direct --> ru_wan["Интернет через РФ"]
+    transit --> overlay["GRE или IPIP<br/>ECMP, если доступны оба"]
+    overlay --> egress["Зарубежный узел<br/>Первый доступный выход<br/>1. wgcf (WireGuard)<br/>2. Официальный WARP<br/>(MASQUE)<br/>3. Зарубежный WAN"]
 ```
 
 | Для нового соединения | Маршрут |
