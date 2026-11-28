@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+"""Regenerate one wgcf profile, verify it on its existing interface, or roll back."""
+import base64
+import fcntl
+import ipaddress
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+class Failure(Exception):
+    """Only fixed, non-secret messages are logged."""
+
+
+class Cancelled(Exception):
+    pass
+
+
+def require(condition, message):
+    if not condition:
+        raise Failure(message)
+
+
+def run(args, *, data=None, timeout=5, cwd=None):
+    return subprocess.run(args, input=data, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                          check=True, timeout=timeout, cwd=cwd).stdout
+
+
+def fsync_dir(directory):
+    fd = os.open(directory, os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def save(path, contents):
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".wgcf-")
+    try:
+        with os.fdopen(fd, "wb") as output:
+            output.write(contents)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(tmp, path)
+        fsync_dir(path.parent)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
+
+def read_optional(path):
+    try:
+        return path.read_bytes()
+    except FileNotFoundError:
+        return None
+
+
+def parse(data):
+    sections = {}
+    fields = None
+    for raw in data.decode("utf-8-sig").splitlines():
+        line = raw.partition("#")[0].strip()
+        if not line:
+            continue
+        if line.startswith("["):
+            require(line in ("[Peer]", "[Interface]") and line not in sections,
+                    "Expected one interface and one peer")
+            fields = sections[line] = {}
+        else:
+            key, equal, value = line.partition("=")
+            require(equal and fields is not None, "Malformed profile")
+            fields.setdefault(key.strip(), []).append(value.strip())
+    return sections["[Interface]"], sections["[Peer]"]
+
+
+def one(section, name):
+    value, = section[name]
+    return value
+
+
+def key(section, name):
+    value = one(section, name)
+    decoded = base64.b64decode(value, validate=True)
+    require(len(decoded) == 32 and any(decoded) and base64.b64encode(decoded).decode() == value,
+            "Invalid WireGuard identity")
+    return value
+
+
+def settings(contents, *, active=False):
+    iface, peer = parse(contents)
+    require(set(peer) <= {"AllowedIPs", "PublicKey", "Endpoint", "PersistentKeepalive"},
+            "Unsupported peer configuration")
+    if active:
+        require(set(iface) <= {"Address", "PrivateKey", "Table", "MTU"} and
+                one(iface, "Table").lower() == "off" and one(iface, "MTU") == "1280" and
+                one(peer, "AllowedIPs") == "0.0.0.0/0", "Unsupported active routing policy")
+    else:
+        require(set(iface) <= {"PrivateKey", "Address", "DNS", "MTU"} and
+                "0.0.0.0/0" in [s.strip() for row in peer["AllowedIPs"] for s in row.split(",")],
+                "Unsupported generated profile")
+    ips = [ipaddress.ip_interface(item.strip()) for row in iface["Address"] for item in row.split(",")]
+    ipv4, = [ip for ip in ips if ip.version == 4]
+    require(ipv4.network.prefixlen == 32 and not ipv4.ip.is_unspecified and not ipv4.ip.is_multicast
+            and (not active or len(ips) == 1), "Expected one IPv4 host address")
+    host, sep, port = one(peer, "Endpoint").rpartition(":")
+    require(sep and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]{0,252}", host) and
+            re.fullmatch(r"[0-9]{1,5}", port) and 0 < int(port) <= 65535, "Invalid IPv4 endpoint")
+    return dict(private=key(iface, "PrivateKey"), peer=key(peer, "PublicKey"),
+                ip=str(ipv4.ip), host=host, port=int(port))
+
+
+def ipv4s(host, current, state):
+    try:
+        addresses = [ipaddress.IPv4Address(host)]
+    except ipaddress.AddressValueError:
+        rows = run(["getent", "ahostsv4", host], timeout=5).splitlines()
+        addresses = sorted({ipaddress.IPv4Address(row.split()[0].decode()) for row in rows})
+    require(addresses, "No candidate IPv4 endpoint")
+    if current in map(str, addresses):
+        pos = addresses.index(ipaddress.IPv4Address(current)) + 1
+        addresses = addresses[pos:] + addresses[:pos]
+    if len(addresses) > 4:
+        cursor = state / "candidate-offset"
+        offset = int(read_optional(cursor) or b"0") % len(addresses)
+        addresses = addresses[offset:] + addresses[:offset]
+        save(cursor, str((offset + 4) % len(addresses)).encode())
+    return list(map(str, addresses[:4]))
+
+
+def link(iface):
+    return next((dev for dev in json.loads(run(["ip", "-j", "link", "show"]))
+                 if dev["ifname"] == iface and "UP" in dev["flags"]), None)
+
+
+def addresses(iface):
+    dev, = json.loads(run(["ip", "-j", "-4", "address", "show", "dev", iface]))
+    return {f"{item['local']}/{item['prefixlen']}" for item in dev["addr_info"]}
+
+
+def switch_address(iface, source, target):
+    old, new = source + "/32", target + "/32"
+    live = addresses(iface)
+    require(live <= {old, new}, "Unexpected IPv4 address on recovery interface")
+    if new not in live:
+        run(["ip", "-4", "addr", "add", new, "dev", iface])
+    if old != new and old in live:
+        run(["ip", "-4", "addr", "del", old, "dev", iface])
+
+
+def trace(iface, source):
+    for address in ("1.1.1.1", "1.0.0.1"):
+        try:
+            body = run(["curl", "--disable", "--noproxy", "*", "--proto", "=https", "-4fsS",
+                        "--interface", "if!" + iface, "--connect-timeout", "2", "--max-time", "3",
+                        "--write-out", "\\n%{local_ip}\\n", f"https://{address}/cdn-cgi/trace"], timeout=4)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            continue
+        rows = body.splitlines()
+        if rows and rows[-1] == source.encode() and {b"warp=on", b"warp=plus"}.intersection(rows[:-1]):
+            return True
+    return False
+
+
+def peer_text(cfg, host):
+    return (f"[Peer]\nPublicKey = {cfg['peer']}\nEndpoint = {host}:{cfg['port']}\n"
+            "AllowedIPs = 0.0.0.0/0\nPersistentKeepalive = 25\n").encode()
+
+
+def active_text(cfg, endpoint):
+    return (f"[Interface]\nPrivateKey = {cfg['private']}\nAddress = {cfg['ip']}/32\n"
+            "MTU = 1280\nTable = off\n\n").encode() + peer_text(cfg, endpoint)
+
+
+def trial_lock(iface):
+    return open(f"/run/lock/wgcf-profile-trial-{iface}.lock", "ab")
+
+
+def finish(pending, work):
+    # Retire the entire journal atomically before removing its private files.
+    pending.rename(work / "finished")
+    fsync_dir(pending.parent)
+
+
+def recover(pending, work, iface, active, source):
+    meta = json.loads((pending / "meta").read_bytes())
+    require(meta["paths"] == [iface, str(active), str(source)], "Journal belongs to another installation")
+    if not (pending / "committed").exists():
+        # Disk rollback also works when the interface was administratively stopped.
+        disk_ok = True
+        for dest, name in ((active, "active"), (source, "source")):
+            old = read_optional(pending / ("old." + name))
+            current = read_optional(dest)
+            if current != old:
+                expected = read_optional(pending / ("new." + name))
+                if expected is None or current != expected:
+                    disk_ok = False
+                    continue
+                try:
+                    if old is None:
+                        dest.unlink()
+                        fsync_dir(dest.parent)
+                    else:
+                        save(dest, old)
+                except OSError:
+                    disk_ok = False
+        if not link(iface):
+            return False
+        require(run(["wg", "show", iface, "public-key"]).decode().strip() == meta["identity"],
+                "Another identity occupies the recovery interface")
+        switch_address(iface, meta["next_ip"], meta["old_ip"])
+        if meta.get("dns_only") and meta.get("old_endpoint"):
+            run(["wg", "set", iface, "peer", meta["old_peer"], "endpoint", meta["old_endpoint"]])
+        else:
+            run(["wg", "setconf", iface, str(pending / "old.live")])
+        require(disk_ok, "Could not restore a profile safely; private journal retained")
+    finish(pending, work)
+    return True
+
+
+def repair(iface, active, source, binary, account, state, work):
+    pending = state / "pending"
+    if pending.exists():
+        with trial_lock(iface) as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if recover(pending, work, iface, active, source):
+                print("Completed interrupted wgcf recovery")
+        return
+    dev = link(iface)
+    if not dev:
+        return
+    old_active = active.read_bytes()
+    old_source = read_optional(source)
+    before = settings(old_active, active=True)
+    require(dev["mtu"] == 1280 and addresses(iface) == {before["ip"] + "/32"},
+            "Active interface differs from its managed profile")
+    if trace(iface, before["ip"]):
+        return
+    generation = True
+    generated = work / "generated.conf"
+    try:
+        run([str(binary), "generate", "--config", str(account), "--profile", str(generated), "--keepalive"],
+            cwd=work, timeout=20)
+        new_source = generated.read_bytes()
+        cfg = settings(new_source)
+        require(cfg["private"] == before["private"], "Generated profile has a different private identity")
+    except (OSError, subprocess.SubprocessError, Failure, KeyError, ValueError):
+        # DNS-only fallback uses the existing identity, port and disk profiles.
+        generation = False
+        cfg = before.copy()
+        try:
+            ipaddress.IPv4Address(cfg["host"])
+        except ipaddress.AddressValueError:
+            pass
+        else:
+            require(old_source is not None, "Generation failed and no DNS source is available")
+            prior = settings(old_source)
+            require(prior["peer"] == cfg["peer"] and prior["private"] == cfg["private"],
+                    "Generation failed and DNS source identity differs")
+            try:
+                ipaddress.IPv4Address(prior["host"])
+            except ipaddress.AddressValueError:
+                cfg["host"] = prior["host"]
+            else:
+                raise Failure("Generation failed and no DNS hostname is available")
+    identity = run(["wg", "pubkey"], data=(before["private"] + "\n").encode()).decode().strip()
+    if not link(iface):
+        return
+    live = run(["wg", "showconf", iface])
+    live_iface, live_peer = parse(live)
+    require(set(live_iface) <= {"PrivateKey", "ListenPort", "FwMark"} and
+            set(live_peer) <= {"PublicKey", "Endpoint", "AllowedIPs", "PersistentKeepalive"} and
+            one(live_peer, "AllowedIPs") == "0.0.0.0/0" and key(live_peer, "PublicKey") == before["peer"] and
+            run(["wg", "show", iface, "public-key"]).decode().strip() == identity,
+            "Live interface differs from the managed identity or policy")
+    old_endpoint = live_peer.get("Endpoint", [""])[0]
+    candidates = ipv4s(cfg["host"], old_endpoint.rpartition(":")[0], state)
+    if not generation:
+        candidates = [ip for ip in candidates if f"{ip}:{cfg['port']}" != old_endpoint]
+        require(candidates, "No distinct DNS fallback endpoint; original peer retained")
+    stage = work / "journal"
+    stage.mkdir(mode=0o700)
+    meta = dict(paths=[iface, str(active), str(source)], identity=identity, old_ip=before["ip"], next_ip=cfg["ip"],
+                dns_only=not generation, old_peer=before["peer"], old_endpoint=old_endpoint)
+    for name, value in (("old.live", live), ("old.active", old_active), ("old.source", old_source),
+                        ("new.source", new_source if generation else None), ("meta", json.dumps(meta).encode())):
+        if value is not None:
+            save(stage / name, value)
+
+    with trial_lock(iface) as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not link(iface) or trace(iface, before["ip"]):
+            return
+        current_link = link(iface)
+        if not current_link or current_link["ifindex"] != dev["ifindex"]:
+            return
+        require(active.read_bytes() == old_active and read_optional(source) == old_source and
+                run(["wg", "showconf", iface]) == live and addresses(iface) == {before["ip"] + "/32"},
+                "Configuration changed while preparing recovery")
+        stage.rename(pending)
+        fsync_dir(state)
+        try:
+            switch_address(iface, before["ip"], cfg["ip"])
+            for endpoint in candidates:
+                if generation:
+                    candidate_file = work / "live.conf"
+                    save(candidate_file, live.split(b"[Peer]", 1)[0] + peer_text(cfg, endpoint))
+                    # A single setconf replaces the peer even for a stale, unchanged endpoint.
+                    run(["wg", "setconf", iface, str(candidate_file)])
+                else:
+                    run(["wg", "set", iface, "peer", cfg["peer"], "endpoint", f"{endpoint}:{cfg['port']}"])
+                if trace(iface, cfg["ip"]):
+                    break
+            else:
+                raise Failure("No candidate passed the bound WARP data-plane probe")
+            require(run(["wg", "show", iface, "endpoints"]).decode().split() ==
+                    [cfg["peer"], f"{endpoint}:{cfg['port']}"] and addresses(iface) == {cfg["ip"] + "/32"},
+                    "The live candidate changed during verification")
+            if generation:
+                require(active.read_bytes() == old_active and read_optional(source) == old_source,
+                        "Profile changed during verification")
+                save(pending / "new.active", active_text(cfg, endpoint))
+                save(active, (pending / "new.active").read_bytes())
+                save(source, (pending / "new.source").read_bytes())
+            save(pending / "committed", b"verified\n")
+            finish(pending, work)
+        except BaseException:
+            if pending.exists():
+                recover(pending, work, iface, active, source)
+            raise
+    print("Verified regenerated wgcf profile" if generation else "Verified existing profile through refreshed DNS")
+
+
+def main():
+    if len(sys.argv) != 7:
+        raise Failure("Usage: recover-wgcf-profile INTERFACE ACTIVE_WG_CONF SOURCE_WGCF_PROFILE WGCF_BIN ACCOUNT_FILE STATE_DIR")
+    iface = sys.argv[1]
+    require(iface not in ("all", "interfaces") and re.fullmatch(r"[a-zA-Z0-9_=+.-]{1,15}", iface),
+            "Invalid interface name")
+    active, source, binary, account, state = [Path(arg).resolve() for arg in sys.argv[2:]]
+    require(len({active, source, binary, account}) == 4, "Recovery inputs must be distinct")
+    os.umask(0o077)
+    state.mkdir(mode=0o700, parents=True, exist_ok=True)
+    stat = state.stat()
+    require(stat.st_uid == os.geteuid() and not stat.st_mode & 0o077, "Recovery state directory must be private")
+    with (state / "worker.lock").open("ab") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        # A SIGKILL can strand private staging data. A live journal is always
+        # at state/pending, never inside these worker-owned temporary directories.
+        for orphan in state.glob(".wgcf-work-*"):
+            if (not orphan.is_symlink() and orphan.is_dir() and orphan.stat().st_uid == os.geteuid()
+                    and not orphan.stat().st_mode & 0o077):
+                shutil.rmtree(orphan)
+        with tempfile.TemporaryDirectory(prefix=".wgcf-work-", dir=state) as tmp:
+            repair(iface, active, source, binary, account, state, Path(tmp))
+
+
+if __name__ == "__main__":
+    def interrupted(signum, frame):
+        raise Cancelled()
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGINT, interrupted)
+    signal.signal(signal.SIGALRM, interrupted)
+    signal.alarm(80)
+    try:
+        main()
+    except Failure as exc:
+        sys.exit(str(exc))
+    except Cancelled:
+        sys.exit("Recovery interrupted")
+    except Exception:
+        sys.exit("Recovery failed; check the private state, service configuration and network")

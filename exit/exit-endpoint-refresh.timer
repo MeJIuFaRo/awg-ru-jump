@@ -1,5 +1,5 @@
 [Unit]
-Description=Retry endpoint DNS resolution while the primary WARP path is unavailable
+Description=Retry profile generation while the primary WARP path is unavailable
 
 [Timer]
 OnBootSec=30s

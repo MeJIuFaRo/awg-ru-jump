@@ -1,16 +1,23 @@
 [Unit]
-Description=Refresh the wgcf peer endpoint after a failed WARP probe
+Description=Regenerate and validate the wgcf profile after a failed WARP probe
 After=exit-health.service
 
 [Service]
 Type=oneshot
-ExecCondition=/usr/bin/systemctl is-active --quiet exit-health.timer
+StateDirectory=exit-wgcf-recovery
+StateDirectoryMode=0700
+UMask=0077
 ExecCondition=/usr/bin/systemctl is-active --quiet wg-quick@exit-warp.service
-ExecCondition=/usr/bin/python3 -c 'import json,sys; from pathlib import Path; p=Path("/run/exit-transit-health.json"); sys.exit(0 if p.is_file() and "wgcf" in json.loads(p.read_text())["failed"] else 1)'
-ExecStart=/usr/local/sbin/refresh-wgcf-endpoint exit-warp /etc/wireguard/exit-warp.conf /etc/ru-exit/wgcf/wgcf-profile.conf
-TimeoutStartSec=15s
+ExecCondition=/bin/sh -c 'test -d /var/lib/exit-wgcf-recovery/pending || /usr/bin/systemctl is-active --quiet exit-health.timer'
+ExecCondition=/usr/bin/python3 -c 'import json,sys; from pathlib import Path; p=Path("/run/exit-transit-health.json"); sys.exit(0 if Path("/var/lib/exit-wgcf-recovery/pending").is_dir() or (p.is_file() and "wgcf" in json.loads(p.read_text())["failed"]) else 1)'
+ExecStart=/usr/local/sbin/recover-wgcf-profile exit-warp /etc/wireguard/exit-warp.conf /etc/ru-exit/wgcf/wgcf-profile.conf /usr/local/bin/wgcf /etc/ru-exit/wgcf/wgcf-account.toml /var/lib/exit-wgcf-recovery
+TimeoutStartSec=120s
+TimeoutStopSec=15s
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
+LimitCORE=0
+ReadWritePaths=/etc/wireguard /etc/ru-exit/wgcf /run/lock
+ReadOnlyPaths=-/etc/ru-exit/wgcf/wgcf-account.toml
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Choose the egress for new IPv4 transit connections."""
 import concurrent.futures
+import contextlib
 import fcntl
 import ipaddress
 import json
@@ -16,6 +17,8 @@ SETS = {"wgcf": "warp_ingress", "official": "official_ingress"}
 MARKS = {"wgcf": ("0x50000", "0x60000"), "official": ("0xd0000", "0xe0000")}
 STATE = Path("/run/exit-transit-health.json")
 LOCK = Path("/run/lock/exit-router.lock")
+TRIAL_LOCK = Path("/run/lock/wgcf-profile-trial-exit-warp.lock")
+PENDING = Path("/var/lib/exit-wgcf-recovery/pending")
 
 
 def run(args, *, data=None, check=True):
@@ -157,16 +160,38 @@ def save(state):
             name.unlink(missing_ok=True)
 
 
+@contextlib.contextmanager
+def committed_primary():
+    with TRIAL_LOCK.open("a") as guard:
+        try:
+            fcntl.flock(guard, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        yield not PENDING.exists()
+
+
 def health():
+    # A trial may serve its own test traffic, but no new client flow until commit.
+    with committed_primary() as committed:
+        health_cycle(committed)
+
+
+def health_cycle(committed):
     active = selectors()
     previous = json.loads(STATE.read_text()) if STATE.exists() else {}
+    tested = tuple(SETS) if committed else ("official",)
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-        results = dict(zip(SETS, pool.map(probe, SETS)))
-    failed = {path for path, (passed, _) in results.items() if not passed}
-    chosen = next((path for path in ("wgcf", "official") if path not in failed), "wan")
+        results = dict(zip(tested, pool.map(probe, tested)))
+    old_failed = set(previous.get("failed", []))
+    observed_failures = {path for path, (passed, _) in results.items() if not passed}
+    failed = observed_failures | (old_failed - set(tested))
+    chosen = next((path for path in tested if results[path][0]), "wan")
     select(active, chosen)
-    wgcf_sources = set(previous.get("wgcf_sources", [])) | results["wgcf"][1]
-    for path in sorted(failed - set(previous.get("failed", []))):
+    wgcf_sources = set(previous.get("wgcf_sources", []))
+    if "wgcf" in results:
+        wgcf_sources.update(results["wgcf"][1])
+    for path in sorted(observed_failures - old_failed):
         if path == "wgcf" and not wgcf_sources:
             wgcf_sources = profile_sources()
         clear_datagrams(path, wgcf_sources if path == "wgcf" else {"10.254.247.1"})

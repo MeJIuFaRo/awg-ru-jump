@@ -103,29 +103,29 @@ sudo systemctl enable --now wg-quick@exit-warp.service
 
 ### Обновление endpoint после отказа wgcf
 
-Если проверка wgcf перестала получать подтверждение WARP, основной монитор сразу выбирает исправный MASQUE или WAN. Отдельный таймер раз в минуту проверяет, остался ли wgcf в списке недоступных путей. Когда служба WireGuard активна, обработчик заново разрешает имя endpoint через системный DNS узла (IPv4). При одном новом A-адресе он выбирает этот адрес. При нескольких выбирает следующий за текущим в отсортированном списке и сохраняет настроенный UDP-порт. Перед сменой адреса ещё раз проверяется доступность WARP через основной интерфейс. Если он уже восстановился, переключение адреса пропускается.
+При отказе основного WARP монитор сначала переводит новые клиентские соединения на MASQUE или WAN. Отдельный таймер восстановления раз в минуту проверяет состояние wgcf. Во время продолжающегося отказа запускается `wgcf generate --keepalive` для **существующей регистрации**. Результат записывается в закрытый временный профиль. Для работы нужны доступ к API Cloudflare с зарубежного узла, установленный `/usr/local/bin/wgcf` и сохранённый `/etc/ru-exit/wgcf/wgcf-account.toml`.
 
-Обновляется только endpoint существующего пира командой `wg set`. Интерфейс, ключи и маршруты остаются на месте. Контроллер вернёт новые соединения на wgcf после успешной HTTPS-пробы. При ошибке DNS или единственном прежнем адресе действующий endpoint сохраняется; таймер попробует снова, пока продолжается отказ. Остановленный вручную интерфейс обработчик не поднимает.
+Обработчик проверяет идентичность устройства, публичный ключ удалённого пира, внутренний IPv4 и endpoint из ответа API, включая **новый UDP-порт**. DNS-имя разрешается через системный резолвер. При нескольких A-записях за попытку проверяются до четырёх IPv4. Во время испытания интерфейс остаётся поднятым, а новые клиентские потоки обслуживает резерв. Политика проекта сохраняется: `Table = off`, MTU 1280, `AllowedIPs = 0.0.0.0/0`, keepalive 25 секунд.
 
-У прежних установок `/etc/wireguard/exit-warp.conf` может содержать только числовой IPv4. Обработчик берёт DNS-имя из `/etc/ru-exit/wgcf/wgcf-profile.conf` при совпадении публичного ключа пира, а порт — из действующей конфигурации. Поэтому сохраните исходный профиль. Если оба профиля содержат только IP или подходящее имя отсутствует, автоматической DNS-замены не будет.
+Условие принятия — HTTPS-ответ Cloudflare Trace с `warp=on` или `warp=plus`, полученный через основной интерфейс **с IPv4 кандидата**. После успеха сохраняются полный исходный профиль от wgcf и рабочая IPv4-конфигурация с проверенным адресом и портом. Исходное имя Cloudflare остаётся в `wgcf-profile.conf`. Штатный монитор возвращает новые соединения на wgcf после собственной проверки. Если рабочий выход успел восстановиться самостоятельно, пробная замена пропускается.
+
+При недоступном API или некорректном результате генерации остаётся попытка DNS-восстановления по прежнему профилю: имя, прежний порт и тот же пир. Для старых числовых конфигураций имя берётся из сохранённого исходного профиля при совпадении идентичности. Неудачное испытание возвращает прежние параметры. Незавершённая операция восстанавливается по журналу в закрытом каталоге `/var/lib/exit-wgcf-recovery`. Остановленный вручную интерфейс обработчик не поднимает.
+
+Установите обработчик и его единицы на зарубежном узле. Для обновления с предыдущей версии сначала остановите старый таймер восстановления и его разовый процесс, если они были установлены. Включите новый таймер вместе с обновлённым монитором в разделе 3.
 
 ```sh
-sudo install -m 0755 exit/refresh-wgcf-endpoint /usr/local/sbin/
+sudo install -m 0755 exit/recover-wgcf-profile /usr/local/sbin/
 sudo install -m 0644 exit/exit-endpoint-refresh.service exit/exit-endpoint-refresh.timer /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now exit-endpoint-refresh.timer
 ```
 
-На существующем узле с уже работающим автоматическим выбором выхода достаточно этого блока. Проверить настройку можно без вывода ключей:
+Проверить результат можно без вывода ключей:
 
 ```sh
-sudo grep -E '^[[:space:]]*Endpoint[[:space:]]*=' /etc/wireguard/exit-warp.conf
 sudo wg show exit-warp endpoints | cut -f2
 sudo systemctl list-timers exit-endpoint-refresh.timer
 sudo journalctl -u exit-endpoint-refresh.service -n 20 --no-pager
 ```
-
-При ручном `systemctl reload wg-quick@exit-warp` служба перечитывает профиль: имя разрешится повторно, числовой адрес будет использован как записан. Полный перезапуск также пересоздаёт интерфейс. В проверенной сборке штатная служба устанавливает `WG_ENDPOINT_RESOLUTION_RETRIES=infinity`. У отдельной службы восстановления есть лимит 15 секунд, поэтому сбой DNS не задерживает выбор MASQUE или WAN.
 
 ### Подготовить второй выход
 
@@ -141,7 +141,7 @@ sudo install -m 0644 exit/exit-policy.nft /etc/ru-exit/
 sudo install -m 0644 exit/exit-router.service exit/exit-health.service exit/exit-health.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now exit-router.service
-sudo systemctl enable --now exit-health.timer
+sudo systemctl enable --now exit-health.timer exit-endpoint-refresh.timer
 sudo systemctl start exit-health.service
 sudo /usr/local/sbin/exit-health status
 sudo wg show exit-warp latest-handshakes
@@ -152,13 +152,19 @@ ip -4 rule show
 
 ```sh
 sudo systemctl stop exit-health.timer exit-health.service
+# При обновлении с версии, в которой уже был таймер восстановления
+if systemctl cat exit-endpoint-refresh.timer >/dev/null 2>&1; then
+  sudo systemctl stop exit-endpoint-refresh.timer exit-endpoint-refresh.service
+fi
+sudo install -m 0755 exit/recover-wgcf-profile /usr/local/sbin/
+sudo install -m 0644 exit/exit-endpoint-refresh.service exit/exit-endpoint-refresh.timer /etc/systemd/system/
 sudo install -m 0755 exit/exit-router exit/exit-health /usr/local/sbin/
 sudo install -m 0644 exit/exit-policy.nft /etc/ru-exit/
 sudo install -m 0644 exit/exit-health.service exit/exit-health.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl reload exit-router.service
 sudo systemctl start exit-health.service
-sudo systemctl enable --now exit-health.timer
+sudo systemctl enable --now exit-health.timer exit-endpoint-refresh.timer
 sudo /usr/local/sbin/exit-health status
 ```
 

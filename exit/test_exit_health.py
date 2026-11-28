@@ -26,6 +26,8 @@ class HealthTests(unittest.TestCase):
         self.addCleanup(self.stack.close)
         state = Path(self.stack.enter_context(tempfile.TemporaryDirectory())) / "health.json"
         self.stack.enter_context(patch.object(controller, "STATE", state))
+        self.stack.enter_context(patch.object(controller, "TRIAL_LOCK", state.with_name("trial.lock")))
+        self.stack.enter_context(patch.object(controller, "PENDING", state.with_name("pending")))
         self.stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
         self.active = {"wgcf": set(), "official": set()}
         self.probes = {"wgcf": (True, {"192.0.2.19"}), "official": (True, {"10.254.247.1"})}
@@ -92,6 +94,18 @@ class HealthTests(unittest.TestCase):
         self.probes["wgcf"] = False, set()
         self.tick("wan")
         self.probes["wgcf"] = True, {"192.0.2.19"}
+        self.tick("wgcf")
+
+    def test_uncommitted_primary_cannot_preempt_standby(self):
+        self.simulate()
+        self.tick("wgcf")
+        with controller.TRIAL_LOCK.open("a") as writer:
+            controller.fcntl.flock(writer, controller.fcntl.LOCK_EX)
+            self.tick("official")
+        controller.PENDING.mkdir()
+        self.tick("official")
+        self.assertFalse(self.deletes)
+        controller.PENDING.rmdir()
         self.tick("wgcf")
 
     def test_concurrent_probes_and_error_preserves_selector(self):
