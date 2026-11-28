@@ -46,14 +46,29 @@ sudo docker inspect --type container \
 
 ## Как выбирается выход в примере с GRE и IPIP
 
+**Узел РФ выбирает маршрут для нового соединения.**
+
 ```mermaid
 flowchart TD
-    client["Клиент AmneziaWG"] --> ingress["Узел РФ"]
-    ingress --> direct["IP в GeoIP:RU,<br/>IP из DNS для CATEGORY-RU<br/>или оба туннеля недоступны"]
-    ingress --> transit["Остальной публичный IPv4<br/>при доступном туннеле"]
-    direct --> ru_wan["Интернет через РФ"]
-    transit --> overlay["GRE или IPIP<br/>ECMP, если доступны оба"]
-    overlay --> egress["Зарубежный узел<br/>Первый доступный выход<br/>1. wgcf (WireGuard)<br/>2. Официальный WARP<br/>(MASQUE)<br/>3. Зарубежный WAN"]
+    client["Клиент AmneziaWG"] --> geo{"IP входит в GeoIP:RU<br/>или получен из DNS<br/>для CATEGORY-RU?"}
+    geo -->|Да| direct["Интернет через РФ"]
+    geo -->|Нет| tunnels{"Сколько туннелей<br/>доступно?"}
+    tunnels -.->|Ни одного| direct
+    tunnels -->|Один| single["Работающий<br/>GRE или IPIP"]
+    tunnels -->|Оба| ecmp["ECMP через<br/>GRE и IPIP"]
+    single --> exit_node["Зарубежный узел"]
+    ecmp --> exit_node
+```
+
+**Зарубежный узел выбирает выход для трафика из GRE и IPIP.**
+
+```mermaid
+flowchart TD
+    exit_node["Зарубежный узел"] --> primary{"wgcf доступен?"}
+    primary -->|Да| wgcf["WARP через wgcf<br/>(WireGuard)"]
+    primary -->|Нет| backup{"MASQUE доступен?"}
+    backup -->|Да| masque["WARP через официальный<br/>клиент (MASQUE)"]
+    backup -->|Нет| wan["Интернет через<br/>зарубежный WAN"]
 ```
 
 | Для нового соединения | Маршрут |
